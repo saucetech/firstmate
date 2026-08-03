@@ -1014,14 +1014,11 @@ validate_neutral_launch_directory() {
     echo "error: neutral launch directory must not be a git repository or worktree: $WT" >&2
     return 1
   fi
-  if fm_neutral_directory_conflicts_with_protected_path \
-      "$WT" "$PROJ_ABS" "$FM_ROOT" "$FM_HOME" "$PROJECTS"; then
-    echo "error: neutral launch directory must be outside protected project and firstmate paths: $WT" >&2
-    return 1
-  fi
+  fm_neutral_directory_is_authorized \
+    "$WT" "$NEUTRAL_IDENTITY" "$STATE/$ID.verify" \
+    "$PROJ_ABS" "$FM_ROOT" "$FM_HOME" "$PROJECTS"
 }
 
-[ "$NEUTRAL_SET" -eq 0 ] || validate_neutral_launch_directory || exit 1
 if [ "$NEUTRAL_SET" -eq 1 ]; then
   NEUTRAL_IDENTITY=$(filesystem_identity "$WT") || {
     echo "error: neutral launch directory filesystem identity cannot be recorded: $WT" >&2
@@ -1032,6 +1029,7 @@ if [ "$NEUTRAL_SET" -eq 1 ]; then
     exit 1
   }
 fi
+[ "$NEUTRAL_SET" -eq 0 ] || validate_neutral_launch_directory || exit 1
 TASK_CWD=$PROJ_ABS
 [ "$NEUTRAL_SET" -eq 0 ] || TASK_CWD=$WT
 

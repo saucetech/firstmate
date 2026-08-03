@@ -888,38 +888,20 @@ validate_removal_target() {
   printf '%s\n' "$abs_target"
 }
 
-filesystem_identity() {
-  stat -f '%d:%i' "$1" 2>/dev/null || stat -c '%d:%i' "$1" 2>/dev/null
-}
-
 validate_neutral_removal_target() {
-  local target=$1 expected_identity=$2 project=$3 actual_identity abs_target
+  local target=$1 expected_identity=$2 project=$3 binding=$4 protected_root=$5 protected_home=$6 protected_projects=$7 abs_target
   [ -n "$target" ] && [ -d "$target" ] && [ ! -L "$target" ] || {
     echo "REFUSED: neutral verifier directory is not a removable ordinary directory: ${target:-<missing>}" >&2
     return 1
   }
-  [ -n "$expected_identity" ] || {
-    echo "REFUSED: neutral verifier directory has no recorded filesystem identity: $target" >&2
-    return 1
-  }
-  actual_identity=$(filesystem_identity "$target") || {
-    echo "REFUSED: neutral verifier directory filesystem identity cannot be read: $target" >&2
-    return 1
-  }
-  [ "$actual_identity" = "$expected_identity" ] || {
-    echo "REFUSED: neutral verifier directory filesystem identity changed for $target (recorded $expected_identity, current $actual_identity)" >&2
-    return 1
-  }
-  abs_target=$(validate_removal_target "$target" "neutral verifier directory") || return 1
   [ ! "$target" -ef / ] || {
     echo "REFUSED: neutral verifier directory is the filesystem root: $target" >&2
     return 1
   }
-  if fm_neutral_directory_conflicts_with_protected_path \
-      "$target" "$project" "$FM_ROOT" "$FM_HOME" "$PROJECTS"; then
-    echo "REFUSED: neutral verifier directory conflicts with a protected path: $target" >&2
-    return 1
-  fi
+  fm_neutral_directory_is_authorized \
+    "$target" "$expected_identity" "$binding" \
+    "$project" "$protected_root" "$protected_home" "$protected_projects" || return 1
+  abs_target=$(removal_target_abs_path "$target") || return 1
   if git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
      || git -C "$target" rev-parse --is-inside-git-dir >/dev/null 2>&1; then
     echo "REFUSED: neutral verifier directory became a git repository: $target" >&2
@@ -929,7 +911,10 @@ validate_neutral_removal_target() {
 }
 
 remove_neutral_directory() {
-  local target=$1
+  local target=$1 expected_identity=$2 project=$3 binding=$4 protected_root=$5 protected_home=$6 protected_projects=$7
+  fm_neutral_directory_is_authorized \
+    "$target" "$expected_identity" "$binding" \
+    "$project" "$protected_root" "$protected_home" "$protected_projects" || return 1
   if ! rm -rf -- "$target" || [ -e "$target" ] || [ -L "$target" ]; then
     echo "error: neutral verifier directory removal could not be confirmed for $target; retaining its durable metadata and binding for reconciliation" >&2
     return 1
@@ -1305,7 +1290,9 @@ validate_firstmate_home_children_removal() {
     elif [ "$child_launch_mode" = neutral ]; then
       child_proj=$(meta_value "$child_meta" project)
       child_neutral_identity=$(meta_value "$child_meta" neutral_identity)
-      validate_neutral_removal_target "$child_wt" "$child_neutral_identity" "$child_proj" >/dev/null || return 1
+      validate_neutral_removal_target \
+        "$child_wt" "$child_neutral_identity" "$child_proj" \
+        "$sub_state/$child_id.verify" "$home" "$home" "$home/projects" >/dev/null || return 1
     elif [ "$child_backend" = orca ]; then
       child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
       if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
@@ -1518,8 +1505,12 @@ cleanup_firstmate_home_children() {
         return 1
       fi
       child_neutral_identity=$(meta_value "$child_meta" neutral_identity)
-      child_neutral_target=$(validate_neutral_removal_target "$child_wt" "$child_neutral_identity" "$child_proj") || return 1
-      remove_neutral_directory "$child_neutral_target" || return 1
+      child_neutral_target=$(validate_neutral_removal_target \
+        "$child_wt" "$child_neutral_identity" "$child_proj" \
+        "$sub_state/$child_id.verify" "$home" "$home" "$home/projects") || return 1
+      remove_neutral_directory \
+        "$child_neutral_target" "$child_neutral_identity" "$child_proj" \
+        "$sub_state/$child_id.verify" "$home" "$home" "$home/projects" || return 1
     elif [ "$child_backend" = orca ]; then
       if [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
@@ -1793,8 +1784,12 @@ if [ "$LAUNCH_MODE" = neutral ]; then
     echo "error: endpoint absence is not confirmed for neutral task $ID at $WT; retaining that directory and every durable identity record" >&2
     exit 1
   fi
-  NEUTRAL_TARGET=$(validate_neutral_removal_target "$WT" "$NEUTRAL_IDENTITY" "$PROJ") || exit 1
-  remove_neutral_directory "$NEUTRAL_TARGET" || exit 1
+  NEUTRAL_TARGET=$(validate_neutral_removal_target \
+    "$WT" "$NEUTRAL_IDENTITY" "$PROJ" "$STATE/$ID.verify" \
+    "$FM_ROOT" "$FM_HOME" "$PROJECTS") || exit 1
+  remove_neutral_directory \
+    "$NEUTRAL_TARGET" "$NEUTRAL_IDENTITY" "$PROJ" "$STATE/$ID.verify" \
+    "$FM_ROOT" "$FM_HOME" "$PROJECTS" || exit 1
 fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
