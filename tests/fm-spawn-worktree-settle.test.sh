@@ -141,7 +141,73 @@ test_already_settled_pane_costs_one_confirm_sleep() {
   pass "an already-settled pane confirms via the existing inter-poll sleep, not an extra full cycle"
 }
 
+test_neutral_mode_refuses_a_git_repository() {
+  local rec id out status
+  id=neutralgitrefusal
+  rec=$(make_settle_case neutral-git "$id" 0)
+  read_settle_record "$rec"
+
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
+    FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" \
+    "$SPAWN" "$id" "$PROJ_DIR" --scout --neutral-dir "$STALE_DIR" 2>&1)
+  status=$?
+  expect_code 1 "$status" "neutral mode must refuse a directory that is a git repository"
+  assert_contains "$out" "must not be a git repository or worktree" \
+    "the neutral-mode refusal must name repository contamination"
+  assert_absent "$HOME_DIR/state/$id.meta" "neutral-mode refusal must happen before metadata publication"
+  pass "fm-spawn: neutral mode refuses a git repository before launch"
+}
+
+test_neutral_mode_refuses_a_directory_inside_the_project() {
+  local rec id out status neutral
+  id=neutralinsideproject
+  rec=$(make_settle_case neutral-inside "$id" 0)
+  read_settle_record "$rec"
+  neutral="$PROJ_DIR/neutral"
+  mkdir -p "$neutral"
+
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
+    FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" \
+    "$SPAWN" "$id" "$PROJ_DIR" --scout --neutral-dir "$neutral" 2>&1)
+  status=$?
+  expect_code 1 "$status" "neutral mode must refuse a directory inside the project"
+  assert_contains "$out" "must not be a git repository or worktree" \
+    "a project descendant must be recognized as repository-contaminated"
+  assert_absent "$HOME_DIR/state/$id.meta" "project containment refusal must happen before metadata publication"
+  pass "fm-spawn: neutral mode refuses a directory inside the project"
+}
+
+test_neutral_mode_records_directory_identity() {
+  local rec id out status neutral identity
+  id=neutralidentity
+  rec=$(make_settle_case neutral-identity "$id" 0)
+  read_settle_record "$rec"
+  neutral="$(dirname "$HOME_DIR")/neutral-artifacts"
+  mkdir -p "$neutral"
+
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
+    FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" \
+    "$SPAWN" "$id" "$PROJ_DIR" --scout --neutral-dir "$neutral" 2>&1)
+  status=$?
+  expect_code 0 "$status" "neutral mode must launch from an isolated ordinary directory (got: $out)"
+  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  assert_grep "launch_mode=neutral" "$HOME_DIR/state/$id.meta" \
+    "neutral task metadata must identify its teardown mode"
+  assert_grep "neutral_identity=$identity" "$HOME_DIR/state/$id.meta" \
+    "neutral task metadata must bind the directory device and inode"
+  pass "fm-spawn: neutral mode records the launch directory filesystem identity"
+}
+
 test_single_stale_first_read_is_not_accepted
 test_already_settled_pane_costs_one_confirm_sleep
+test_neutral_mode_refuses_a_git_repository
+test_neutral_mode_refuses_a_directory_inside_the_project
+test_neutral_mode_records_directory_identity
 
 echo "# all fm-spawn-worktree-settle tests passed"

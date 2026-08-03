@@ -688,6 +688,135 @@ test_scout_and_secondmate_load_decision_hold_policy() {
   pass "fm-brief.sh: investigation and visual-review completions load the shared decision policy"
 }
 
+# --- verify briefs ----------------------------------------------------------
+#
+# The verifier's whole value is that it judges the product without inheriting
+# the builder's assumptions, and the only place that is enforced is this
+# generated brief. These tests hold that contract: the brief must forbid the
+# specific commands and files that would contaminate it, must make a vacuous
+# "delivered" unreachable, and must keep the verifier outside every repository.
+
+# Scaffold a verify brief into a fresh home and echo its path.
+scaffold_verify_brief() {
+  local id=$1 promise=$2 artifact=$3 home
+  home="$TMP_ROOT/verify-$id"
+  mkdir -p "$home/data"
+  FM_VERIFY_PROMISE="$promise" FM_VERIFY_ARTIFACTS="- $artifact" \
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" savour --verify >/dev/null \
+    || fail "fm-brief.sh --verify exited non-zero for $id"
+  printf '%s\n' "$home/data/$id/brief.md"
+}
+
+test_verify_brief_enforces_independence() {
+  local brief
+  brief=$(scaffold_verify_brief vfy-indep-a1 'A user can import a link and cook the result.' deadbee1234)
+  assert_present "$brief" "verify brief was not scaffolded"
+  assert_grep 'git diff' "$brief" "verify brief must forbid reading the change with git diff"
+  assert_grep 'git log' "$brief" "verify brief must forbid reading the change history"
+  assert_grep 'git blame' "$brief" "verify brief must forbid git blame"
+  assert_grep 'pull request' "$brief" "verify brief must forbid opening the pull request"
+  assert_grep 'status log' "$brief" \
+    "verify brief must forbid reading the implementing task's status log"
+  assert_grep 'clone, fetch, download' "$brief" \
+    "verify brief must forbid obtaining the repository"
+  pass "fm-brief --verify: brief forbids every route back to the implementation"
+}
+
+test_verify_brief_names_artifacts_without_repository_setup() {
+  local brief
+  brief=$(scaffold_verify_brief vfy-rev-b2 'A user gets a named recipe.' /neutral/artifacts/Recipe.app)
+  assert_grep '/neutral/artifacts/Recipe.app' "$brief" \
+    "verify brief must name the runnable artifact"
+  assert_grep 'do NOT have the source tree' "$brief" \
+    "verify brief must state that source isolation is structural"
+  assert_no_grep 'git checkout' "$brief" "verify brief must not instruct a repository checkout"
+  assert_no_grep 'AGENTS.md' "$brief" "verify brief must not name developer-facing instructions"
+  pass "fm-brief --verify: names the artifact and declares structural source isolation"
+}
+
+test_verify_brief_does_not_build_or_discover_source() {
+  local brief
+  brief=$(scaffold_verify_brief vfy-build-b3 'A user gets a named recipe.' /neutral/artifacts/app)
+  assert_grep 'Do not build the product' "$brief" \
+    "verify brief must exercise the built artifact instead of rebuilding"
+  assert_grep 'user-level verifier, not a test runner' "$brief" \
+    "verify brief must distinguish product verification from pipeline tests"
+  assert_no_grep "README's run or quickstart section\|explicit run script" "$brief" \
+    "verify brief must not contain build discovery instructions"
+  pass "fm-brief --verify: verifier exercises artifacts without build discovery"
+}
+
+test_verify_brief_makes_a_vacuous_delivered_unreachable() {
+  local brief
+  brief=$(scaffold_verify_brief vfy-evid-c3 'A user sees real ingredients.' feed0011aa)
+  # The load-bearing rule: an untested claim caps the verdict, so a verifier
+  # that exercised nothing cannot truthfully report `delivered`.
+  assert_grep 'any untested claim can never be' "$brief" \
+    "verify brief must cap the verdict when a claim went untested"
+  assert_grep 'are not evidence' "$brief" \
+    "verify brief must reject placeholder findings as evidence"
+  assert_grep 'partially delivered' "$brief" "verify brief must offer the partial verdict"
+  assert_grep 'not delivered' "$brief" "verify brief must offer the failing verdict"
+  assert_grep 'BLOCKS the merge' "$brief" \
+    "verify brief must tell the verifier its failing verdict blocks the merge"
+  pass "fm-brief --verify: evidence rules make an unearned 'delivered' unreachable"
+}
+
+test_verify_brief_requires_the_honest_sections() {
+  local brief
+  brief=$(scaffold_verify_brief vfy-sect-d4 'A user completes onboarding.' 0badcafe99)
+  assert_grep 'Looks finished but is not' "$brief" \
+    "verify brief must require the looks-finished-but-is-not section"
+  assert_grep 'What I could not test' "$brief" \
+    "verify brief must require the untested-surface section"
+  assert_grep 'Independence attestation' "$brief" \
+    "verify brief must require an independence attestation"
+  pass "fm-brief --verify: report must state what looks done, what went untested, and its own independence"
+}
+
+test_verify_brief_requires_simulator_hygiene() {
+  local brief
+  brief=$(scaffold_verify_brief vfy-sim-e5 'A user opens the app.' 11223344aa)
+  assert_grep 'shut it down AND delete it' "$brief" \
+    "verify brief must require simulators to be shut down and deleted"
+  assert_grep 'remaining count must be zero' "$brief" \
+    "verify brief must require a zero remaining simulator count"
+  pass "fm-brief --verify: simulator hygiene is a stated requirement with a reported count"
+}
+
+test_verify_brief_changes_nothing() {
+  local brief
+  brief=$(scaffold_verify_brief vfy-ro-f6 'A user saves a recipe.' 998877aabb)
+  assert_grep 'You change nothing.' "$brief" "verify brief must declare the task read-only"
+  assert_grep 'is NOT yours to fix' "$brief" \
+    "verify brief must stop the verifier fixing what it finds"
+  assert_no_grep 'git checkout -b' "$brief" "verify brief must never create a branch"
+  pass "fm-brief --verify: verifier is read-only and never repairs what it finds"
+}
+
+test_verify_brief_carries_the_promise_and_the_bar() {
+  local brief
+  brief=$(scaffold_verify_brief vfy-prom-g7 'Pasting a TikTok link yields a cookable recipe.' aabbccdd11)
+  # Placed under its own heading, not merely present somewhere in the file, so
+  # an unfilled promise section cannot pass on an incidental match elsewhere.
+  grep -A1 '^# The promise you are verifying$' "$brief" \
+    | grep -qF 'Pasting a TikTok link yields a cookable recipe.' \
+    || fail "the supplied promise must be what the verifier reads under the promise heading"
+  assert_grep 'core AI features working so that users can get the promised result' "$brief" \
+    "verify brief must carry the captain's bar verbatim"
+  pass "fm-brief --verify: brief carries the promise and the captain's bar"
+}
+
+test_kind_flags_are_mutually_exclusive() {
+  local out rc home="$TMP_ROOT/kind-clash"
+  mkdir -p "$home/data"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-brief.sh" clash-h8 savour --scout --verify 2>&1); rc=$?
+  expect_code 1 "$rc" "combining --scout and --verify must fail rather than silently pick one"
+  assert_contains "$out" "mutually exclusive" "the refusal must name the conflict"
+  assert_absent "$home/data/clash-h8/brief.md" "no brief may be written for a conflicting kind"
+  pass "fm-brief: conflicting kind flags fail closed instead of letting flag order decide"
+}
+
 # Scout and secondmate paths still scaffold well-formed briefs.
 test_scout_and_secondmate_scaffold() {
   local brief
@@ -728,3 +857,12 @@ test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
+test_verify_brief_enforces_independence
+test_verify_brief_names_artifacts_without_repository_setup
+test_verify_brief_does_not_build_or_discover_source
+test_verify_brief_makes_a_vacuous_delivered_unreachable
+test_verify_brief_requires_the_honest_sections
+test_verify_brief_requires_simulator_hygiene
+test_verify_brief_changes_nothing
+test_verify_brief_carries_the_promise_and_the_bar
+test_kind_flags_are_mutually_exclusive

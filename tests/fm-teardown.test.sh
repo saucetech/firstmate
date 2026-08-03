@@ -498,6 +498,20 @@ run_teardown() {
     "$TEARDOWN" task-x1 "$@"
 }
 
+install_failing_neutral_rm() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/rm" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [ -n "${FM_FAIL_RM_TARGET:-}" ] && [ "$arg" = "$FM_FAIL_RM_TARGET" ]; then
+    exit 73
+  fi
+done
+exec /bin/rm "$@"
+SH
+  chmod +x "$case_dir/fakebin/rm"
+}
+
 test_local_only_fork_remote_allows() {
   local case_dir rc
   case_dir=$(make_case fork-allow)
@@ -1626,6 +1640,211 @@ test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed() {
   pass "forced secondmate teardown retains Herdr child identity until exact pane disappearance"
 }
 
+test_neutral_teardown_refuses_replaced_directory_identity() {
+  local case_dir neutral retained identity rc
+  case_dir=$(make_case neutral-identity-mismatch)
+  neutral="$case_dir/neutral-verifier"
+  retained="$case_dir/original-neutral-verifier"
+  mkdir -p "$neutral"
+  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "window=firstmate:fm-task-x1" \
+    "endpoint_task_id=task-x1" \
+    "worktree=$neutral" \
+    "project=$case_dir/project" \
+    "kind=scout" \
+    "mode=no-mistakes" \
+    "launch_mode=neutral" \
+    "neutral_identity=$identity"
+  mv "$neutral" "$retained"
+  mkdir -p "$neutral"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "neutral identity mismatch: teardown removed a replacement directory"
+  [ -d "$neutral" ] || fail "neutral identity mismatch: replacement directory was deleted"
+  [ -d "$retained" ] || fail "neutral identity mismatch: original bound directory was deleted"
+  [ -e "$case_dir/state/task-x1.meta" ] || fail "neutral identity mismatch: durable metadata was erased"
+  assert_grep "filesystem identity changed" "$case_dir/stderr" \
+    "neutral identity mismatch: refusal did not identify the changed target"
+  pass "neutral teardown refuses a path whose filesystem identity changed"
+}
+
+test_neutral_teardown_retains_records_when_removal_fails() {
+  local case_dir neutral identity removal_target rc
+  case_dir=$(make_case neutral-removal-failure)
+  neutral="$case_dir/neutral-verifier"
+  mkdir -p "$neutral"
+  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "window=firstmate:fm-task-x1" \
+    "endpoint_task_id=task-x1" \
+    "worktree=$neutral" \
+    "project=$case_dir/project" \
+    "kind=scout" \
+    "mode=no-mistakes" \
+    "launch_mode=neutral" \
+    "neutral_identity=$identity"
+  printf '%s\n' 'verifies=ship-x1' > "$case_dir/state/task-x1.verify"
+  install_failing_neutral_rm "$case_dir"
+  removal_target="$(CDPATH='' cd -- "$(dirname "$neutral")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$neutral")")"
+  export FM_FAIL_RM_TARGET="$removal_target"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  unset FM_FAIL_RM_TARGET
+  [ "$rc" -ne 0 ] || fail "neutral removal failure: teardown reported success"
+  [ -d "$neutral" ] || fail "neutral removal failure: target disappeared unexpectedly"
+  [ -e "$case_dir/state/task-x1.meta" ] || fail "neutral removal failure: task metadata was erased"
+  [ -e "$case_dir/state/task-x1.verify" ] || fail "neutral removal failure: verifier binding was erased"
+  assert_grep "$removal_target" "$case_dir/stderr" \
+    "neutral removal failure: refusal did not report the exact retained path"
+  pass "neutral teardown retains identity records when directory removal fails"
+}
+
+test_neutral_teardown_retains_records_when_endpoint_absence_is_unconfirmed() {
+  local case_dir neutral identity rc
+  case_dir=$(make_case neutral-endpoint-unconfirmed)
+  neutral="$case_dir/neutral-verifier"
+  mkdir -p "$neutral"
+  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "window=firstmate:fm-task-x1" \
+    "endpoint_task_id=task-x1" \
+    "worktree=$neutral" \
+    "project=$case_dir/project" \
+    "kind=scout" \
+    "mode=local-only" \
+    "launch_mode=neutral" \
+    "neutral_identity=$identity"
+  printf '%s\n' 'verifies=ship-x1' > "$case_dir/state/task-x1.verify"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  kill-window) exit 1 ;;
+  list-windows) printf '%s\n' 'firstmate:fm-task-x1 firstmate:@7'; exit 0 ;;
+esac
+exit 1
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "neutral endpoint uncertainty: teardown reported success"
+  [ -d "$neutral" ] || fail "neutral endpoint uncertainty: verifier directory was deleted"
+  [ -e "$case_dir/state/task-x1.meta" ] || fail "neutral endpoint uncertainty: task metadata was erased"
+  [ -e "$case_dir/state/task-x1.verify" ] || fail "neutral endpoint uncertainty: verifier binding was erased"
+  assert_grep "task-x1 at $neutral" "$case_dir/stderr" \
+    "neutral endpoint uncertainty: refusal did not name the task and retained path"
+  pass "neutral teardown retains records until endpoint absence is confirmed"
+}
+
+test_forced_secondmate_teardown_removes_neutral_child() {
+  local case_dir home neutral identity
+  case_dir=$(make_case secondmate-neutral-child)
+  write_meta "$case_dir" local-only secondmate
+  home="$case_dir/secondmate-home"
+  neutral="$case_dir/neutral-child"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects" "$neutral"
+  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
+  printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
+  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  fm_write_meta "$home/state/child-neutral.meta" \
+    "window=firstmate:fm-child-neutral" \
+    "endpoint_task_id=child-neutral" \
+    "worktree=$neutral" \
+    "project=$case_dir/project" \
+    "kind=scout" \
+    "mode=no-mistakes" \
+    "launch_mode=neutral" \
+    "neutral_identity=$identity"
+
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "forced secondmate teardown could not retire its neutral verifier child"
+  [ ! -e "$neutral" ] || fail "forced secondmate teardown retained the neutral child directory"
+  [ ! -e "$case_dir/state/task-x1.meta" ] || fail "forced secondmate teardown retained parent metadata"
+  pass "forced secondmate teardown retires neutral children without treehouse"
+}
+
+test_forced_secondmate_retains_neutral_child_when_removal_fails() {
+  local case_dir home neutral identity removal_target rc
+  case_dir=$(make_case secondmate-neutral-child-removal-failure)
+  write_meta "$case_dir" local-only secondmate
+  home="$case_dir/secondmate-home"
+  neutral="$case_dir/neutral-child"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects" "$neutral"
+  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
+  printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
+  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  fm_write_meta "$home/state/child-neutral.meta" \
+    "window=firstmate:fm-child-neutral" \
+    "endpoint_task_id=child-neutral" \
+    "worktree=$neutral" \
+    "project=$case_dir/project" \
+    "kind=scout" \
+    "mode=no-mistakes" \
+    "launch_mode=neutral" \
+    "neutral_identity=$identity"
+  printf '%s\n' 'verifies=ship-child' > "$home/state/child-neutral.verify"
+  install_failing_neutral_rm "$case_dir"
+  removal_target="$(CDPATH='' cd -- "$(dirname "$neutral")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$neutral")")"
+  export FM_FAIL_RM_TARGET="$removal_target"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  unset FM_FAIL_RM_TARGET
+  [ "$rc" -ne 0 ] || fail "neutral child removal failure: forced teardown reported success"
+  [ -d "$neutral" ] || fail "neutral child removal failure: target disappeared unexpectedly"
+  [ -e "$home/state/child-neutral.meta" ] || fail "neutral child removal failure: child metadata was erased"
+  [ -e "$home/state/child-neutral.verify" ] || fail "neutral child removal failure: child binding was erased"
+  [ -e "$case_dir/state/task-x1.meta" ] || fail "neutral child removal failure: parent metadata was erased"
+  [ -d "$home" ] || fail "neutral child removal failure: secondmate home was erased"
+  assert_grep "$removal_target" "$case_dir/stderr" \
+    "neutral child removal failure: refusal did not report the exact retained path"
+  pass "forced secondmate teardown retains a neutral child after removal failure"
+}
+
+test_forced_secondmate_retains_neutral_child_when_endpoint_is_unconfirmed() {
+  local case_dir home neutral identity rc
+  case_dir=$(make_case secondmate-neutral-child-endpoint-unconfirmed)
+  write_meta "$case_dir" local-only secondmate
+  home="$case_dir/secondmate-home"
+  neutral="$case_dir/neutral-child"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects" "$neutral"
+  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
+  printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
+  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  fm_write_meta "$home/state/child-neutral.meta" \
+    "window=firstmate:fm-child-neutral" \
+    "endpoint_task_id=child-neutral" \
+    "worktree=$neutral" \
+    "project=$case_dir/project" \
+    "kind=scout" \
+    "mode=no-mistakes" \
+    "launch_mode=neutral" \
+    "neutral_identity=$identity"
+  printf '%s\n' 'verifies=ship-child' > "$home/state/child-neutral.verify"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  kill-window) exit 1 ;;
+  list-windows) printf '%s\n' 'firstmate:fm-child-neutral firstmate:@9'; exit 0 ;;
+esac
+exit 1
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "neutral child endpoint uncertainty: forced teardown reported success"
+  [ -d "$neutral" ] || fail "neutral child endpoint uncertainty: child directory was deleted"
+  [ -e "$home/state/child-neutral.meta" ] || fail "neutral child endpoint uncertainty: child metadata was erased"
+  [ -e "$home/state/child-neutral.verify" ] || fail "neutral child endpoint uncertainty: child binding was erased"
+  [ -e "$case_dir/state/task-x1.meta" ] || fail "neutral child endpoint uncertainty: parent metadata was erased"
+  [ -d "$home" ] || fail "neutral child endpoint uncertainty: secondmate home was erased"
+  assert_grep "child-neutral at $neutral" "$case_dir/stderr" \
+    "neutral child endpoint uncertainty: refusal did not name the child and retained path"
+  pass "forced secondmate teardown retains neutral children with uncertain endpoints"
+}
+
 configure_nested_secondmate_with_herdr_grandchild() {  # <case-dir>
   local case_dir=$1 home="$1/secondmate-home" nested_home="$1/secondmate-home/nested-home"
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
@@ -1839,6 +2058,12 @@ test_herdr_flat_teardown_refuses_records_on_unparseable_presence
 test_herdr_flat_teardown_preflight_refuses_before_changes
 test_forced_secondmate_herdr_child_preflight_refuses_before_changes
 test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed
+test_neutral_teardown_refuses_replaced_directory_identity
+test_neutral_teardown_retains_records_when_removal_fails
+test_neutral_teardown_retains_records_when_endpoint_absence_is_unconfirmed
+test_forced_secondmate_teardown_removes_neutral_child
+test_forced_secondmate_retains_neutral_child_when_removal_fails
+test_forced_secondmate_retains_neutral_child_when_endpoint_is_unconfirmed
 test_forced_teardown_retains_nested_secondmate_home_when_grandchild_close_unconfirmed
 test_herdr_projection_teardown_retires_journal_only_after_confirmed_close
 test_herdr_projection_teardown_retains_journal_when_close_unconfirmed
