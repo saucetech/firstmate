@@ -1862,6 +1862,57 @@ test_forced_secondmate_teardown_removes_neutral_child() {
   pass "forced secondmate teardown retires neutral children without treehouse"
 }
 
+assert_forced_secondmate_refuses_parent_protected_neutral() {
+  local name=$1 protected_kind=$2 case_dir active_home parent_projects home neutral identity rc
+  case_dir=$(make_case "$name")
+  write_meta "$case_dir" local-only secondmate
+  active_home="$case_dir/active-parent-home"
+  parent_projects="$case_dir/external-parent-projects"
+  home="$case_dir/secondmate-home"
+  mkdir -p "$active_home" "$parent_projects" \
+    "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
+  printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
+  case "$protected_kind" in
+    home) neutral=$active_home ;;
+    projects) neutral=$parent_projects ;;
+    *) fail "unknown parent protected kind: $protected_kind" ;;
+  esac
+  printf '%s\n' keep > "$neutral/must-survive"
+  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  fm_write_meta "$home/state/child-neutral.meta" \
+    "window=firstmate:fm-child-neutral" \
+    "endpoint_task_id=child-neutral" \
+    "worktree=$neutral" \
+    "project=$case_dir/project" \
+    "kind=scout" \
+    "mode=no-mistakes" \
+    "launch_mode=neutral" \
+    "neutral_identity=$identity"
+  write_neutral_binding "$home/state/child-neutral.verify" "$neutral" "$identity"
+
+  rc=0
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$active_home" \
+    FM_STATE_OVERRIDE="$case_dir/state" FM_CONFIG_OVERRIDE="$case_dir/config" \
+    FM_PROJECTS_OVERRIDE="$parent_projects" PATH="$case_dir/fakebin:$PATH" \
+    "$TEARDOWN" task-x1 --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "parent $protected_kind protection: forced teardown reported success"
+  [ -e "$neutral/must-survive" ] || fail "parent $protected_kind protection: protected data was deleted"
+  [ -e "$home/state/child-neutral.meta" ] || fail "parent $protected_kind protection: child metadata was erased"
+  [ -e "$home/state/child-neutral.verify" ] || fail "parent $protected_kind protection: child binding was erased"
+  [ -e "$case_dir/state/task-x1.meta" ] || fail "parent $protected_kind protection: parent metadata was erased"
+  assert_grep "conflicts with a protected path" "$case_dir/stderr" \
+    "parent $protected_kind protection: refusal did not identify the protected path"
+}
+
+test_forced_secondmate_teardown_protects_active_parent_paths() {
+  assert_forced_secondmate_refuses_parent_protected_neutral \
+    secondmate-neutral-active-parent-home home
+  assert_forced_secondmate_refuses_parent_protected_neutral \
+    secondmate-neutral-active-parent-projects projects
+  pass "forced secondmate teardown protects active parent paths"
+}
+
 test_forced_secondmate_retains_neutral_child_when_removal_fails() {
   local case_dir home neutral identity removal_target rc
   case_dir=$(make_case secondmate-neutral-child-removal-failure)
@@ -2161,6 +2212,7 @@ test_neutral_teardown_allows_directory_beneath_operator_home
 test_neutral_teardown_refuses_an_unbound_directory
 test_neutral_teardown_refuses_a_mismatched_binding_identity
 test_forced_secondmate_teardown_removes_neutral_child
+test_forced_secondmate_teardown_protects_active_parent_paths
 test_forced_secondmate_retains_neutral_child_when_removal_fails
 test_forced_secondmate_retains_neutral_child_when_endpoint_is_unconfirmed
 test_forced_teardown_retains_nested_secondmate_home_when_grandchild_close_unconfirmed

@@ -27,8 +27,9 @@ fm_neutral_binding_value() {
 }
 
 fm_neutral_directory_conflicts_with_protected_path() {
-  local target=$1 project=$2 fm_root=$3 fm_home=$4 projects=$5 protected
-  for protected in "$project" "$fm_root" "$fm_home" "$projects"; do
+  local target=$1 protected
+  shift
+  for protected in "$@"; do
     [ -d "$protected" ] || continue
     if fm_path_is_same_or_descendant_by_identity "$target" "$protected" \
        || fm_path_is_same_or_descendant_by_identity "$protected" "$target"; then
@@ -39,8 +40,9 @@ fm_neutral_directory_conflicts_with_protected_path() {
 }
 
 fm_neutral_directory_is_authorized() {
-  local target=$1 expected_identity=$2 binding=$3 project=$4 fm_root=$5 fm_home=$6 projects=$7
+  local target=$1 expected_identity=$2 binding=$3
   local recorded_path recorded_identity current_identity
+  shift 3
   [ -d "$target" ] && [ ! -L "$target" ] || {
     echo "REFUSED: neutral directory is not an ordinary directory: ${target:-<missing>}" >&2
     return 1
@@ -71,8 +73,15 @@ fm_neutral_directory_is_authorized() {
       echo "REFUSED: neutral directory does not match its verifier ownership binding: $target" >&2
       return 1
     }
-  if fm_neutral_directory_conflicts_with_protected_path \
-      "$target" "$project" "$fm_root" "$fm_home" "$projects"; then
+  [ ! "$target" -ef / ] || {
+    echo "REFUSED: neutral directory is the filesystem root: $target" >&2
+    return 1
+  }
+  if [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ "$target" -ef "$HOME" ]; then
+    echo "REFUSED: neutral directory is the operator home: $target" >&2
+    return 1
+  fi
+  if fm_neutral_directory_conflicts_with_protected_path "$target" "$@"; then
     echo "REFUSED: neutral directory conflicts with a protected path: $target" >&2
     return 1
   fi
