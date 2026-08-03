@@ -94,6 +94,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 SECONDMATE_REG="$DATA/secondmates.md"
 SUB_HOME_MARKER=".fm-secondmate-home"
 # shellcheck source=bin/fm-tasks-axi-lib.sh
@@ -148,6 +149,8 @@ ORCA_PATH_MATCH_VERIFIED=0
 
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
+LAUNCH_MODE=$(fm_meta_get "$META" launch_mode)
+NEUTRAL_IDENTITY=$(fm_meta_get "$META" neutral_identity)
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
 PUBLIC_FOLLOWUP_HOME=$FM_HOME
@@ -883,6 +886,124 @@ validate_removal_target() {
   printf '%s\n' "$abs_target"
 }
 
+filesystem_identity() {
+  stat -f '%d:%i' "$1" 2>/dev/null || stat -c '%d:%i' "$1" 2>/dev/null
+}
+
+path_is_same_or_descendant_by_identity() {
+  local current=$1 ancestor=$2 parent
+  [ -d "$current" ] && [ -d "$ancestor" ] || return 1
+  current=$(CDPATH='' cd -- "$current" && pwd -P) || return 1
+  ancestor=$(CDPATH='' cd -- "$ancestor" && pwd -P) || return 1
+  while :; do
+    [ "$current" -ef "$ancestor" ] && return 0
+    parent=$(CDPATH='' cd -- "$current/.." && pwd -P) || return 1
+    [ "$parent" -ef "$current" ] && return 1
+    current=$parent
+  done
+}
+
+validate_neutral_removal_target() {
+  local target=$1 expected_identity=$2 project=$3 actual_identity protected candidate abs_target
+  [ -n "$target" ] && [ -d "$target" ] && [ ! -L "$target" ] || {
+    echo "REFUSED: neutral verifier directory is not a removable ordinary directory: ${target:-<missing>}" >&2
+    return 1
+  }
+  [ -n "$expected_identity" ] || {
+    echo "REFUSED: neutral verifier directory has no recorded filesystem identity: $target" >&2
+    return 1
+  }
+  actual_identity=$(filesystem_identity "$target") || {
+    echo "REFUSED: neutral verifier directory filesystem identity cannot be read: $target" >&2
+    return 1
+  }
+  [ "$actual_identity" = "$expected_identity" ] || {
+    echo "REFUSED: neutral verifier directory filesystem identity changed for $target (recorded $expected_identity, current $actual_identity)" >&2
+    return 1
+  }
+  abs_target=$(validate_removal_target "$target" "neutral verifier directory") || return 1
+  [ ! "$target" -ef / ] || {
+    echo "REFUSED: neutral verifier directory is the filesystem root: $target" >&2
+    return 1
+  }
+  for protected in "${HOME:-}" "$FM_ROOT" "$FM_HOME" "$project" "$PROJECTS"; do
+    [ -d "$protected" ] || continue
+    if path_is_same_or_descendant_by_identity "$target" "$protected" \
+       || path_is_same_or_descendant_by_identity "$protected" "$target"; then
+      echo "REFUSED: neutral verifier directory conflicts with a protected path: $target" >&2
+      return 1
+    fi
+  done
+  if [ -d "$PROJECTS" ]; then
+    for candidate in "$PROJECTS"/*; do
+      [ -d "$candidate" ] || continue
+      if path_is_same_or_descendant_by_identity "$target" "$candidate" \
+         || path_is_same_or_descendant_by_identity "$candidate" "$target"; then
+        echo "REFUSED: neutral verifier directory conflicts with a project clone: $target" >&2
+        return 1
+      fi
+    done
+  fi
+  if git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+     || git -C "$target" rev-parse --is-inside-git-dir >/dev/null 2>&1; then
+    echo "REFUSED: neutral verifier directory became a git repository: $target" >&2
+    return 1
+  fi
+  printf '%s\n' "$abs_target"
+}
+
+remove_neutral_directory() {
+  local target=$1
+  if ! rm -rf -- "$target" || [ -e "$target" ] || [ -L "$target" ]; then
+    echo "error: neutral verifier directory removal could not be confirmed for $target; retaining its durable metadata and binding for reconciliation" >&2
+    return 1
+  fi
+}
+
+neutral_endpoint_absence_confirmed() {
+  local backend=$1 target=$2 session pane listed named stable workspaces panes workspace surface
+  case "$backend" in
+    tmux)
+      listed=$(tmux list-windows -a -F '#{session_name}:#{window_name} #{session_name}:#{window_id}' 2>/dev/null) || return 1
+      while IFS=' ' read -r named stable; do
+        [ "$target" != "$named" ] || return 1
+        [ "$target" != "$stable" ] || return 1
+      done <<EOF
+$listed
+EOF
+      return 0
+      ;;
+    zellij)
+      fm_backend_source zellij || return 1
+      fm_backend_zellij_parse_target "$target" || return 1
+      session=$FM_BACKEND_ZELLIJ_SESSION
+      pane=$FM_BACKEND_ZELLIJ_PANE
+      listed=$(zellij list-sessions --short --no-formatting 2>/dev/null) || return 1
+      printf '%s\n' "$listed" | grep -qxF "$session" || return 0
+      panes=$(fm_backend_zellij_cli "$session" action list-panes --json 2>/dev/null) || return 1
+      printf '%s' "$panes" | jq -e --argjson pane "$pane" 'type == "array" and any(.[]?; .id == $pane and .is_plugin == false)' >/dev/null 2>&1 && return 1
+      printf '%s' "$panes" | jq -e 'type == "array"' >/dev/null 2>&1
+      ;;
+    cmux)
+      fm_backend_source cmux || return 1
+      fm_backend_cmux_parse_target "$target" || return 1
+      workspace=$FM_BACKEND_CMUX_WORKSPACE
+      surface=$FM_BACKEND_CMUX_SURFACE
+      workspaces=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) || return 1
+      printf '%s' "$workspaces" | jq -e --arg workspace "$workspace" 'type == "object" and (.workspaces | type == "array")' >/dev/null 2>&1 || return 1
+      printf '%s' "$workspaces" | jq -e --arg workspace "$workspace" 'any(.workspaces[]?; .id == $workspace)' >/dev/null 2>&1 || return 0
+      panes=$(fm_backend_cmux_cli list-panes --workspace "$workspace" --json --id-format uuids 2>/dev/null) || return 1
+      printf '%s' "$panes" | jq -e --arg surface "$surface" 'type == "object" and (.panes | type == "array")' >/dev/null 2>&1 || return 1
+      printf '%s' "$panes" | jq -e --arg surface "$surface" 'any(.panes[]?; (.surface_ids // []) | index($surface))' >/dev/null 2>&1 && return 1
+      return 0
+      ;;
+    herdr)
+      fm_backend_herdr_endpoint_confirmed_gone "$target"
+      ;;
+  esac
+  return 1
+}
+
 registered_descendant_home_for_removal() {
   local reg=$1 target=$2 line id registered_home registered_abs
   [ -f "$reg" ] || return 1
@@ -1187,7 +1308,7 @@ preflight_firstmate_home_process_event_tree() {
 }
 
 validate_firstmate_home_children_removal() {
-  local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id
+  local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_launch_mode child_neutral_identity
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -1199,11 +1320,16 @@ validate_firstmate_home_children_removal() {
     child_kind=$(meta_value "$child_meta" kind)
     [ -n "$child_kind" ] || child_kind=ship
     child_backend=$(fm_backend_of_meta "$child_meta")
+    child_launch_mode=$(meta_value "$child_meta" launch_mode)
     if [ "$child_kind" = secondmate ]; then
       child_home=$(meta_value "$child_meta" home)
       [ -n "$child_home" ] || child_home=$child_wt
       validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" >/dev/null || return 1
       validate_firstmate_home_children_removal "$child_home" || return 1
+    elif [ "$child_launch_mode" = neutral ]; then
+      child_proj=$(meta_value "$child_meta" project)
+      child_neutral_identity=$(meta_value "$child_meta" neutral_identity)
+      validate_neutral_removal_target "$child_wt" "$child_neutral_identity" "$child_proj" >/dev/null || return 1
     elif [ "$child_backend" = orca ]; then
       child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
       if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
@@ -1355,7 +1481,7 @@ preflight_firstmate_home_herdr_children() {  # <home>
 }
 
 cleanup_firstmate_home_children() {
-  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_busy_gen
+  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_busy_gen child_launch_mode child_neutral_identity child_neutral_target
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -1366,12 +1492,13 @@ cleanup_firstmate_home_children() {
     child_kind=$(meta_value "$child_meta" kind)
     [ -n "$child_kind" ] || child_kind=ship
     child_backend=$(fm_backend_of_meta "$child_meta")
+    child_launch_mode=$(meta_value "$child_meta" launch_mode)
     if [ "$child_backend" = orca ]; then
       child_t=$(meta_value "$child_meta" terminal)
     else
       child_t=$(fm_backend_target_of_meta "$child_meta")
     fi
-    if [ "$child_backend" = orca ] && [ "$child_kind" != secondmate ]; then
+    if [ "$child_backend" = orca ] && [ "$child_kind" != secondmate ] && [ "$child_launch_mode" != neutral ]; then
       child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
       if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
@@ -1404,6 +1531,19 @@ cleanup_firstmate_home_children() {
         cleanup_firstmate_home_children "$child_home" || return $?
         remove_firstmate_home "$child_home" "child firstmate home" "$child_id" || return $?
       fi
+    elif [ "$child_launch_mode" = neutral ]; then
+      if [ "$child_backend" = zellij ]; then
+        if ! ( unset FM_ROOT_OVERRIDE; FM_HOME=$home FM_ROOT=$home neutral_endpoint_absence_confirmed "$child_backend" "$child_t" ); then
+          echo "error: endpoint absence is not confirmed for neutral child $child_id at $child_wt; retaining that directory and every durable identity record" >&2
+          return 1
+        fi
+      elif ! neutral_endpoint_absence_confirmed "$child_backend" "$child_t"; then
+        echo "error: endpoint absence is not confirmed for neutral child $child_id at $child_wt; retaining that directory and every durable identity record" >&2
+        return 1
+      fi
+      child_neutral_identity=$(meta_value "$child_meta" neutral_identity)
+      child_neutral_target=$(validate_neutral_removal_target "$child_wt" "$child_neutral_identity" "$child_proj") || return 1
+      remove_neutral_directory "$child_neutral_target" || return 1
     elif [ "$child_backend" = orca ]; then
       if [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
@@ -1533,7 +1673,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] &&
   ORCA_PATH_MATCH_VERIFIED=1
 fi
 
-if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
+if [ -d "$WT" ] && [ "$FORCE" != "--force" ] && [ "$LAUNCH_MODE" != neutral ]; then
   if validate_worktree_teardown_safety; then
     :
   else
@@ -1582,7 +1722,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   fi
   [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
   fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
-elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
+elif [ -d "$WT" ] && [ "$KIND" != secondmate ] && [ "$LAUNCH_MODE" != neutral ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
   if [ "$branch" != "HEAD" ]; then
     if git -C "$WT" checkout --detach -q 2>/dev/null; then
@@ -1671,6 +1811,14 @@ if [ "$BACKEND" = herdr ]; then
     echo "error: herdr pane $T for $ID is not confirmed gone after its close was refused, skipped, or failed; retaining every durable task record - rerun teardown once the close can run under the session lock" >&2
     exit 1
   fi
+fi
+if [ "$LAUNCH_MODE" = neutral ]; then
+  if ! neutral_endpoint_absence_confirmed "$BACKEND" "$T"; then
+    echo "error: endpoint absence is not confirmed for neutral task $ID at $WT; retaining that directory and every durable identity record" >&2
+    exit 1
+  fi
+  NEUTRAL_TARGET=$(validate_neutral_removal_target "$WT" "$NEUTRAL_IDENTITY" "$PROJ") || exit 1
+  remove_neutral_directory "$NEUTRAL_TARGET" || exit 1
 fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT

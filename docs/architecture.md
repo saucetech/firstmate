@@ -158,6 +158,7 @@ The helper's header owns the exact signal detection, relocated-home limitation, 
 
 Ship tasks change projects and ship by project mode (`no-mistakes`, `direct-PR`, or `local-only`); scout tasks leave standalone investigation reports at `data/<id>/report.md` and never push.
 The intake and authority contract in `AGENTS.md` owns when separate scout research is warranted.
+Independent pre-merge verification deliberately reuses the scout runtime shape - scratch worktree, report deliverable, no branch or PR - and records its extra provenance in a private `state/<verify-id>.verify` binding; `fm-verify.sh` owns the exact mechanics.
 
 ## Dispatch profiles
 
