@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # fm-send post-submit settle pause (FM_SEND_SETTLE).
 #
-# fm-send's success only proves the composer cleared - the Enter landed and the
-# text was submitted. The harness then takes a beat to spin up the turn before its
-# busy footer appears, so an immediate peek after fm-send returns would see the
-# stale idle pane. fm-send therefore pauses FM_SEND_SETTLE seconds (default 1, 0
+# fm-send's success proves delivery under the selected backend's submit contract.
+# The harness then takes a beat to spin up the turn before its busy footer appears,
+# so an immediate peek after fm-send returns would see the stale idle pane.
+# fm-send therefore pauses FM_SEND_SETTLE seconds (default 1, 0
 # disables) after a successful text submit, so the receiving turn has time to
 # visibly start. These tests pin that behavior hermetically (stubbed tmux + sleep,
 # no real agent):
