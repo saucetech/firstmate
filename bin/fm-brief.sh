@@ -381,6 +381,8 @@ $VERIFY_PROMISE
 
 # The bar you judge against
 The captain's standing bar, verbatim: "I want the core UI to be built in properly, and then I want the core AI features working so that users can get the promised result from using it."
+This bar sets the quality standard applied to the claims in the promise; it never adds requirements the promise does not make. A promise with no UI or AI claim is not judged against UI or AI criteria.
+The verdict is determined solely by the promise's own claims.
 Judge through the eyes of this product's ideal user, not through what would be reasonable for the effort involved.
 The user does not care how hard it was. They care whether they got the result.
 

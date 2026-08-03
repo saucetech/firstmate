@@ -111,6 +111,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-public-followup-lib.sh"
 # shellcheck source=bin/fm-secondmate-registry-lib.sh
 . "$SCRIPT_DIR/fm-secondmate-registry-lib.sh"
+# shellcheck source=bin/fm-neutral-dir-lib.sh
+. "$SCRIPT_DIR/fm-neutral-dir-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
   echo "error: invalid teardown request" >&2
   exit 2
@@ -890,21 +892,8 @@ filesystem_identity() {
   stat -f '%d:%i' "$1" 2>/dev/null || stat -c '%d:%i' "$1" 2>/dev/null
 }
 
-path_is_same_or_descendant_by_identity() {
-  local current=$1 ancestor=$2 parent
-  [ -d "$current" ] && [ -d "$ancestor" ] || return 1
-  current=$(CDPATH='' cd -- "$current" && pwd -P) || return 1
-  ancestor=$(CDPATH='' cd -- "$ancestor" && pwd -P) || return 1
-  while :; do
-    [ "$current" -ef "$ancestor" ] && return 0
-    parent=$(CDPATH='' cd -- "$current/.." && pwd -P) || return 1
-    [ "$parent" -ef "$current" ] && return 1
-    current=$parent
-  done
-}
-
 validate_neutral_removal_target() {
-  local target=$1 expected_identity=$2 project=$3 actual_identity protected candidate abs_target
+  local target=$1 expected_identity=$2 project=$3 actual_identity abs_target
   [ -n "$target" ] && [ -d "$target" ] && [ ! -L "$target" ] || {
     echo "REFUSED: neutral verifier directory is not a removable ordinary directory: ${target:-<missing>}" >&2
     return 1
@@ -926,23 +915,10 @@ validate_neutral_removal_target() {
     echo "REFUSED: neutral verifier directory is the filesystem root: $target" >&2
     return 1
   }
-  for protected in "${HOME:-}" "$FM_ROOT" "$FM_HOME" "$project" "$PROJECTS"; do
-    [ -d "$protected" ] || continue
-    if path_is_same_or_descendant_by_identity "$target" "$protected" \
-       || path_is_same_or_descendant_by_identity "$protected" "$target"; then
-      echo "REFUSED: neutral verifier directory conflicts with a protected path: $target" >&2
-      return 1
-    fi
-  done
-  if [ -d "$PROJECTS" ]; then
-    for candidate in "$PROJECTS"/*; do
-      [ -d "$candidate" ] || continue
-      if path_is_same_or_descendant_by_identity "$target" "$candidate" \
-         || path_is_same_or_descendant_by_identity "$candidate" "$target"; then
-        echo "REFUSED: neutral verifier directory conflicts with a project clone: $target" >&2
-        return 1
-      fi
-    done
+  if fm_neutral_directory_conflicts_with_protected_path \
+      "$target" "$project" "$FM_ROOT" "$FM_HOME" "$PROJECTS"; then
+    echo "REFUSED: neutral verifier directory conflicts with a protected path: $target" >&2
+    return 1
   fi
   if git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
      || git -C "$target" rev-parse --is-inside-git-dir >/dev/null 2>&1; then

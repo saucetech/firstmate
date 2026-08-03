@@ -804,7 +804,13 @@ test_verify_brief_carries_the_promise_and_the_bar() {
     || fail "the supplied promise must be what the verifier reads under the promise heading"
   assert_grep 'core AI features working so that users can get the promised result' "$brief" \
     "verify brief must carry the captain's bar verbatim"
-  pass "fm-brief --verify: brief carries the promise and the captain's bar"
+  assert_grep 'never adds requirements the promise does not make' "$brief" \
+    "the captain's bar must not create claims outside the supplied promise"
+  assert_grep 'no UI or AI claim is not judged against UI or AI criteria' "$brief" \
+    "non-UI and non-AI promises must not inherit unrelated criteria"
+  assert_grep "verdict is determined solely by the promise's own claims" "$brief" \
+    "the verdict must remain bound to the supplied promise"
+  pass "fm-brief --verify: the captain's bar applies only to promised claims"
 }
 
 test_kind_flags_are_mutually_exclusive() {

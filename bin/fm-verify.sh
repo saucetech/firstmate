@@ -12,7 +12,7 @@
 #   --build-cmd <command>  project-specific command run in a detached build worktree
 #   --artifact <path>      runnable artifact relative to that worktree; repeatable
 #   --rev <commit-ish>     revision to verify; default fm/<ship-task-id>
-#   --verify-id <id>       verifier task id; default <ship-task-id>-verify
+#   --verify-id <id>       verifier task id; default <ship-task-id>-verify-<revision>
 #   --harness <name> | --model <name> | --effort <level> | --backend <name>
 #                          passed through to bin/fm-spawn.sh unchanged
 #   --dry-run              run preflight and print the plan without writing
@@ -151,7 +151,22 @@ REV=$(git -C "$PROJECT" rev-parse --verify --quiet "$REV_SOURCE^{commit}" 2>/dev
 }
 REV_SHORT=$(git -C "$PROJECT" rev-parse --short "$REV")
 
-[ -n "$VERIFY_ID" ] || VERIFY_ID="$SHIP_ID-verify"
+sha256_hex() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    sha256sum | awk '{print $1}'
+  fi
+}
+
+if [ -z "$VERIFY_ID" ]; then
+  VERIFY_ID_STEM=$SHIP_ID
+  if [ "${#VERIFY_ID_STEM}" -gt 44 ]; then
+    TASK_ID_DIGEST=$(printf '%s' "$SHIP_ID" | sha256_hex)
+    VERIFY_ID_STEM="${SHIP_ID:0:31}-${TASK_ID_DIGEST:0:12}"
+  fi
+  VERIFY_ID="$VERIFY_ID_STEM-verify-${REV:0:12}"
+fi
 fm_task_id_creation_valid "$VERIFY_ID" || { echo "error: invalid verifier task id '$VERIFY_ID'" >&2; exit 2; }
 [ "$VERIFY_ID" != "$SHIP_ID" ] || { echo "error: the verifier task id must differ from '$SHIP_ID'" >&2; exit 2; }
 VERIFY_META="$STATE/$VERIFY_ID.meta"
@@ -159,6 +174,7 @@ VERIFY_SIDECAR="$STATE/$VERIFY_ID.verify"
 VERIFY_DATA_DIR="$DATA/$VERIFY_ID"
 VERIFY_BRIEF="$VERIFY_DATA_DIR/brief.md"
 VERIFY_REPORT="$VERIFY_DATA_DIR/report.md"
+VERIFY_SIDECAR_IDENTITY=
 if [ -e "$VERIFY_META" ]; then
   if [ -e "$VERIFY_SIDECAR" ]; then
     echo "error: a verification of '$SHIP_ID' is already under way as '$VERIFY_ID'" >&2
@@ -173,6 +189,21 @@ if [ -e "$VERIFY_SIDECAR" ]; then
   STALE_BUILD_CONTAINER=$(fm_meta_get "$VERIFY_SIDECAR" build_cleanup_container)
   STALE_BUILD_PIDS=$(fm_meta_get "$VERIFY_SIDECAR" build_cleanup_pids)
   STALE_ENDPOINT_UNCERTAIN=$(fm_meta_get "$VERIFY_SIDECAR" endpoint_uncertain)
+  STALE_RESERVATION_PID=$(fm_meta_get "$VERIFY_SIDECAR" reservation_pid)
+  STALE_VERIFIES=$(fm_meta_get "$VERIFY_SIDECAR" verifies)
+  if [ -n "$STALE_VERIFIES" ] && [ "$STALE_VERIFIES" != "$SHIP_ID" ]; then
+    echo "error: task id '$VERIFY_ID' is already in use" >&2
+    exit 1
+  fi
+  case "$STALE_RESERVATION_PID" in
+    ''|*[!0-9]*) ;;
+    *)
+      if kill -0 "$STALE_RESERVATION_PID" 2>/dev/null; then
+        echo "error: a verification of '$SHIP_ID' is already under way as '$VERIFY_ID'" >&2
+        exit 1
+      fi
+      ;;
+  esac
   STALE_LIVE_PIDS=
   OLD_IFS=$IFS
   IFS=,
@@ -213,8 +244,13 @@ if [ -e "$VERIFY_SIDECAR" ]; then
     echo "       reconcile task '$VERIFY_ID' before retrying" >&2
     exit 1
   fi
+  VERIFY_SIDECAR_IDENTITY=$(fm_pr_file_identity "$VERIFY_SIDECAR") || {
+    echo "error: verifier binding identity cannot be read at $VERIFY_SIDECAR" >&2
+    exit 1
+  }
 fi
 [ ! -e "$VERIFY_BRIEF" ] || { echo "error: a brief already exists at $VERIFY_BRIEF" >&2; exit 1; }
+[ ! -e "$VERIFY_REPORT" ] || { echo "error: a report already exists at $VERIFY_REPORT" >&2; exit 1; }
 
 live_verifications() {
   local sidecar id reservation_pid endpoint_uncertain count=0
@@ -542,11 +578,7 @@ trap 'handle_verification_signal 143' TERM
 trap 'handle_verification_signal 129' HUP
 
 promise_digest() {
-  if command -v shasum >/dev/null 2>&1; then
-    printf '%s' "$PROMISE" | shasum -a 256 | awk '{print "sha256:" $1}'
-  else
-    printf '%s' "$PROMISE" | sha256sum | awk '{print "sha256:" $1}'
-  fi
+  printf 'sha256:%s\n' "$(printf '%s' "$PROMISE" | sha256_hex)"
 }
 
 write_sidecar() {
@@ -562,13 +594,28 @@ write_sidecar() {
   } > "$tmp" && mv "$tmp" "$VERIFY_SIDECAR"
 }
 
-clear_reservation() {
-  local tmp="$STATE/.$VERIFY_ID.verify.$$"
-  if awk '$0 !~ /^reservation_pid=/' "$VERIFY_SIDECAR" > "$tmp"; then
-    mv "$tmp" "$VERIFY_SIDECAR" || rm -f "$tmp"
-  else
+remove_sidecar_fields() {
+  local pattern=$1
+  local tmp="$STATE/.$VERIFY_ID.verify.$$" grep_rc
+  [ -f "$VERIFY_SIDECAR" ] || return 1
+  if ! awk -v pattern="$pattern" '$0 !~ pattern' "$VERIFY_SIDECAR" > "$tmp"; then
     rm -f "$tmp"
+    return 1
   fi
+  if ! mv "$tmp" "$VERIFY_SIDECAR"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if grep -Eq "$pattern" "$VERIFY_SIDECAR"; then
+    return 1
+  else
+    grep_rc=$?
+  fi
+  [ "$grep_rc" -eq 1 ]
+}
+
+clear_reservation() {
+  remove_sidecar_fields '^reservation_pid='
 }
 
 mark_endpoint_uncertain() {
@@ -576,17 +623,26 @@ mark_endpoint_uncertain() {
 }
 
 clear_spawn_handoff() {
-  local tmp="$STATE/.$VERIFY_ID.verify.$$"
-  if awk '$0 !~ /^(reservation_pid|endpoint_uncertain)=/' "$VERIFY_SIDECAR" > "$tmp"; then
-    mv "$tmp" "$VERIFY_SIDECAR" || rm -f "$tmp"
-  else
-    rm -f "$tmp"
-  fi
+  remove_sidecar_fields '^(reservation_pid|endpoint_uncertain)='
 }
 
 mkdir -p "$STATE"
 fm_lock_acquire_wait "$CAPACITY_LOCK"
 CAPACITY_LOCK_HELD=1
+if [ -e "$VERIFY_META" ] || [ -e "$VERIFY_BRIEF" ] || [ -e "$VERIFY_REPORT" ]; then
+  echo "error: verifier task id '$VERIFY_ID' became unavailable while reserving it" >&2
+  exit 1
+fi
+if [ -n "$VERIFY_SIDECAR_IDENTITY" ]; then
+  CURRENT_SIDECAR_IDENTITY=$(fm_pr_file_identity "$VERIFY_SIDECAR" 2>/dev/null || true)
+  if [ "$CURRENT_SIDECAR_IDENTITY" != "$VERIFY_SIDECAR_IDENTITY" ]; then
+    echo "error: verifier task id '$VERIFY_ID' became unavailable while reserving it" >&2
+    exit 1
+  fi
+elif [ -e "$VERIFY_SIDECAR" ]; then
+  echo "error: verifier task id '$VERIFY_ID' became unavailable while reserving it" >&2
+  exit 1
+fi
 LIVE=$(live_verifications)
 if [ "$LIVE" -ge "$MAX_CONCURRENT" ]; then
   CAPACITY_LOCK_HELD=0
@@ -1325,7 +1381,10 @@ KEEP_BINDING=1
 if [ "$SPAWN_RC" -ne 0 ]; then
   if [ -e "$VERIFY_META" ]; then
     SPAWN_ENDPOINT_UNCERTAIN=0
-    clear_spawn_handoff
+    clear_spawn_handoff || {
+      echo "error: partial spawn handoff could not be persisted for task '$VERIFY_ID'; binding retained for reconciliation" >&2
+      exit 1
+    }
     echo "error: partial spawn left in place for task '$VERIFY_ID'; verifier brief and binding retained" >&2
     echo "       reconcile task '$VERIFY_ID' before retrying verification" >&2
     exit 1
@@ -1340,6 +1399,9 @@ if [ ! -e "$VERIFY_META" ]; then
   exit 1
 fi
 SPAWN_ENDPOINT_UNCERTAIN=0
-clear_spawn_handoff
+clear_spawn_handoff || {
+  echo "error: successful spawn handoff could not be persisted for task '$VERIFY_ID'; binding retained for reconciliation" >&2
+  exit 1
+}
 
 printf 'verifying %s at %s as %s (verdict: %s)\n' "$SHIP_ID" "$REV_SHORT" "$VERIFY_ID" "$VERIFY_REPORT"

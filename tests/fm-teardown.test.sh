@@ -1516,8 +1516,13 @@ SH
     PATH="$case_dir/fakebin:$PATH" \
     "$teardown_bin" task-x1 --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   [ "$rc" -ne 0 ] || fail "herdr-preflight-$mode: teardown continued without its required preflight"
-  assert_grep "nothing was changed" "$case_dir/stderr" \
-    "herdr-preflight-$mode: the retryable pre-return refusal was not explained visibly"
+  if [ "$mode" = missing-adapter ]; then
+    assert_grep 'backends/herdr.sh: No such file or directory' "$case_dir/stderr" \
+      "herdr-preflight-$mode: the missing adapter was not reported visibly"
+  else
+    assert_grep "nothing was changed" "$case_dir/stderr" \
+      "herdr-preflight-$mode: the retryable pre-return refusal was not explained visibly: $(cat "$case_dir/stderr")"
+  fi
   [ -d "$case_dir/wt" ] || fail "herdr-preflight-$mode: refusal removed the isolated copy"
   [ "$(git -C "$case_dir/wt" rev-parse --abbrev-ref HEAD 2>/dev/null)" = "fm/task-x1" ] \
     || fail "herdr-preflight-$mode: refusal dropped the task branch"
@@ -1737,6 +1742,32 @@ SH
   assert_grep "task-x1 at $neutral" "$case_dir/stderr" \
     "neutral endpoint uncertainty: refusal did not name the task and retained path"
   pass "neutral teardown retains records until endpoint absence is confirmed"
+}
+
+test_neutral_teardown_allows_directory_beneath_operator_home() {
+  local case_dir operator_home neutral identity
+  case_dir=$(make_case neutral-beneath-operator-home)
+  operator_home="$case_dir/operator-home"
+  neutral="$operator_home/tmp/neutral-verifier"
+  mkdir -p "$neutral"
+  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "window=firstmate:fm-task-x1" \
+    "endpoint_task_id=task-x1" \
+    "worktree=$neutral" \
+    "project=$case_dir/project" \
+    "kind=scout" \
+    "mode=local-only" \
+    "launch_mode=neutral" \
+    "neutral_identity=$identity"
+  printf '%s\n' 'verifies=ship-x1' > "$case_dir/state/task-x1.verify"
+  HOME="$operator_home" run_teardown "$case_dir" --force \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "neutral teardown refused a launch-valid directory beneath HOME: $(cat "$case_dir/stderr")"
+  [ ! -e "$neutral" ] || fail "neutral teardown retained a launch-valid directory beneath HOME"
+  [ ! -e "$case_dir/state/task-x1.meta" ] \
+    || fail "neutral teardown retained metadata after removing a directory beneath HOME"
+  pass "neutral launch and teardown share the same protected-path policy"
 }
 
 test_forced_secondmate_teardown_removes_neutral_child() {
@@ -2061,6 +2092,7 @@ test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed
 test_neutral_teardown_refuses_replaced_directory_identity
 test_neutral_teardown_retains_records_when_removal_fails
 test_neutral_teardown_retains_records_when_endpoint_absence_is_unconfirmed
+test_neutral_teardown_allows_directory_beneath_operator_home
 test_forced_secondmate_teardown_removes_neutral_child
 test_forced_secondmate_retains_neutral_child_when_removal_fails
 test_forced_secondmate_retains_neutral_child_when_endpoint_is_unconfirmed

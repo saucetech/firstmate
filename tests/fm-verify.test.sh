@@ -28,8 +28,10 @@ BUILD_CMD='mkdir -p build && cp README.md build/app.txt'
 BUILD_ARTIFACT='build/app.txt'
 REAL_GIT_VERIFY=$(command -v git)
 REAL_MKTEMP_VERIFY=$(command -v mktemp)
+REAL_MV_VERIFY=$(command -v mv)
 export REAL_GIT_VERIFY
 export REAL_MKTEMP_VERIFY
+export REAL_MV_VERIFY
 
 # new_fixture <slug> [ship-id] [kind]: a home with one finished ship task whose
 # branch fm/<ship-id> carries a commit the task's clone can resolve.
@@ -83,8 +85,22 @@ SH
 VERIFY_OUT=
 VERIFY_RC=0
 run_verify() {
+  local ship=${1:-} arg
+  local has_verify_id=0
+  local verify_args=()
+  shift || true
+  for arg in "$@"; do
+    case "$arg" in --verify-id|--verify-id=*) has_verify_id=1 ;; esac
+  done
+  if [ "$has_verify_id" -eq 1 ]; then
+    verify_args=("$@")
+  else
+    verify_args=(--verify-id demo-ship-verify)
+    [ "$#" -eq 0 ] || verify_args+=("$@")
+  fi
   VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    "$ROOT/bin/fm-verify.sh" "$@" --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
+    "$ROOT/bin/fm-verify.sh" "$ship" "${verify_args[@]}" \
+    --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
   VERIFY_RC=$?
   return 0
 }
@@ -148,7 +164,7 @@ test_promise_is_mandatory() {
 test_build_configuration_is_mandatory() {
   new_fixture build-required
   VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" 2>&1)
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" 2>&1)
   VERIFY_RC=$?
   expect_code 2 "$VERIFY_RC" "fm-verify must refuse without an artifact build configuration"
   assert_contains "$VERIFY_OUT" "no configured way to produce a runnable artifact" \
@@ -292,7 +308,7 @@ test_capacity_defers_and_never_skips() {
   printf 'verifies=other\n' > "$FIX_HOME/state/other-verify.verify"
 
   VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    FM_VERIFY_MAX_CONCURRENT=1 "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    FM_VERIFY_MAX_CONCURRENT=1 "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
   VERIFY_RC=$?
   expect_code 1 "$VERIFY_RC" "a verification at the capacity limit must not proceed"
@@ -311,7 +327,7 @@ test_capacity_ignores_finished_verifications() {
   # holds no build or simulator slot.
   printf 'verifies=old\n' > "$FIX_HOME/state/old-verify.verify"
   VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    FM_VERIFY_MAX_CONCURRENT=1 "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    FM_VERIFY_MAX_CONCURRENT=1 "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
   VERIFY_RC=$?
   expect_code 0 "$VERIFY_RC" \
@@ -398,6 +414,71 @@ test_concurrent_admission_keeps_one_available_slot() {
   pass "fm-verify: concurrent callers cannot both surrender an available slot"
 }
 
+test_concurrent_same_id_reservation_is_exclusive() {
+  local out_a out_b pid_a pid_b rc_a rc_b successes lines
+  new_fixture identity-atomic
+  out_a="$FIX_TMP/same-a.out"
+  out_b="$FIX_TMP/same-b.out"
+  TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
+    FM_VERIFY_MAX_CONCURRENT=2 "$ROOT/bin/fm-verify.sh" demo-ship --verify-id same-verifier \
+    --promise "$PROMISE" --build-cmd 'sleep 1; mkdir -p build; cp README.md build/app.txt' \
+    --artifact "$BUILD_ARTIFACT" > "$out_a" 2>&1 &
+  pid_a=$!
+  TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
+    FM_VERIFY_MAX_CONCURRENT=2 "$ROOT/bin/fm-verify.sh" demo-ship --verify-id same-verifier \
+    --promise "$PROMISE" --build-cmd 'sleep 1; mkdir -p build; cp README.md build/app.txt' \
+    --artifact "$BUILD_ARTIFACT" > "$out_b" 2>&1 &
+  pid_b=$!
+  wait "$pid_a"; rc_a=$?
+  wait "$pid_b"; rc_b=$?
+  successes=0
+  [ "$rc_a" -ne 0 ] || successes=$((successes + 1))
+  [ "$rc_b" -ne 0 ] || successes=$((successes + 1))
+  [ "$successes" -eq 1 ] \
+    || fail "same verifier id must admit exactly one contender, got rc_a=$rc_a rc_b=$rc_b"
+  lines=$(wc -l < "$FIX_SPAWN_LOG" | tr -d ' ')
+  [ "$lines" -eq 1 ] || fail "same verifier id launched $lines verifier endpoints"
+  pass "fm-verify: concurrent callers cannot reserve the same verifier id"
+}
+
+test_default_id_rolls_forward_with_the_revision() {
+  local first_rev first_id second_rev second_id
+  new_fixture revision-default-id
+  first_rev=$(git -C "$FIX_PROJ" rev-parse fm/demo-ship)
+  first_id="demo-ship-verify-${first_rev:0:12}"
+  VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
+  VERIFY_RC=$?
+  expect_code 0 "$VERIFY_RC" "the first revision-specific default verification must spawn"
+  assert_present "$FIX_HOME/state/$first_id.verify" \
+    "the default verifier id must include the bound revision"
+  rm -f "$FIX_HOME/state/$first_id.meta"
+  git -C "$FIX_PROJ" checkout -q fm/demo-ship
+  printf 'next shipped change\n' >> "$FIX_PROJ/README.md"
+  git -C "$FIX_PROJ" add README.md
+  git -C "$FIX_PROJ" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm 'next shipped change'
+  git -C "$FIX_PROJ" checkout -q -
+  second_rev=$(git -C "$FIX_PROJ" rev-parse fm/demo-ship)
+  second_id="demo-ship-verify-${second_rev:0:12}"
+  VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
+  VERIFY_RC=$?
+  expect_code 0 "$VERIFY_RC" "a moved head must receive a new default verifier id"
+  [ "$first_id" != "$second_id" ] || fail "two revisions resolved to the same verifier id"
+  assert_present "$FIX_HOME/data/$first_id/brief.md" \
+    "re-verification discarded the earlier verifier brief"
+  assert_present "$FIX_HOME/state/$first_id.verify" \
+    "re-verification discarded the earlier revision binding"
+  assert_present "$FIX_HOME/data/$second_id/brief.md" \
+    "re-verification did not create a new verifier brief"
+  assert_present "$FIX_HOME/state/$second_id.verify" \
+    "re-verification did not create a new revision binding"
+  pass "fm-verify: default ids preserve evidence across head revisions"
+}
+
 test_spawn_failure_with_unknown_endpoint_retains_artifacts() {
   local neutral
   new_fixture rollback
@@ -439,20 +520,23 @@ test_uncertain_endpoint_holds_capacity() {
   pass "fm-verify: uncertain endpoints retain their capacity slots"
 }
 
-test_spawn_failure_preserves_an_existing_data_directory() {
+test_existing_report_refuses_id_reuse() {
   new_fixture rollback-existing-data
   mkdir -p "$FIX_HOME/data/demo-ship-verify"
   printf 'retained report\n' > "$FIX_HOME/data/demo-ship-verify/report.md"
   new_fake_spawn "$TMP_ROOT/rollback-existing-data" 1
   run_verify demo-ship --promise "$PROMISE"
-  [ "$VERIFY_RC" -ne 0 ] || fail "a failed spawn must be reported as a failure"
+  expect_code 1 "$VERIFY_RC" "a verifier id with existing evidence must be refused"
+  assert_contains "$VERIFY_OUT" "report already exists" \
+    "the refusal must identify the retained verifier report"
   assert_grep 'retained report' "$FIX_HOME/data/demo-ship-verify/report.md" \
-    "uncertain spawn handling must preserve data that predates this invocation"
-  assert_present "$FIX_HOME/data/demo-ship-verify/brief.md" \
-    "uncertain spawn handling must retain the new brief for reconciliation"
-  assert_present "$FIX_HOME/state/demo-ship-verify.verify" \
-    "uncertain spawn handling must retain the binding it created"
-  pass "fm-verify: uncertain spawn handling preserves existing verifier data"
+    "id reuse must preserve the earlier verifier report"
+  assert_absent "$FIX_HOME/data/demo-ship-verify/brief.md" \
+    "id reuse must not add a brief beside earlier evidence"
+  assert_absent "$FIX_HOME/state/demo-ship-verify.verify" \
+    "id reuse must not publish a replacement binding"
+  [ ! -s "$FIX_SPAWN_LOG" ] || fail "id reuse reached verifier spawn"
+  pass "fm-verify: verifier ids cannot overwrite existing evidence"
 }
 
 test_partial_spawn_retains_reconciliation_artifacts() {
@@ -476,10 +560,41 @@ SH
   pass "fm-verify: partial spawn artifacts remain available for reconciliation"
 }
 
+test_spawn_handoff_persistence_failure_is_reported() {
+  local fakebin
+  new_fixture handoff-persistence
+  fakebin="$FIX_TMP/fakebin"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+source_path=${1:-}
+destination=${2:-}
+if [ "$destination" = "${FM_VERIFY_TEST_SIDECAR:-}" ] \
+   && grep -q '^endpoint_uncertain=1$' "$destination" 2>/dev/null \
+   && ! grep -q '^endpoint_uncertain=' "$source_path" 2>/dev/null; then
+  exit 73
+fi
+exec "$REAL_MV_VERIFY" "$@"
+SH
+  chmod +x "$fakebin/mv"
+  VERIFY_OUT=$(PATH="$fakebin:$PATH" TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" \
+    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
+    FM_VERIFY_TEST_SIDECAR="$FIX_HOME/state/demo-ship-verify.verify" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
+    --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
+  VERIFY_RC=$?
+  expect_code 1 "$VERIFY_RC" "a failed handoff write must fail the verifier spawn"
+  assert_contains "$VERIFY_OUT" "handoff could not be persisted" \
+    "the handoff failure must report its durable-state problem"
+  assert_grep 'endpoint_uncertain=1' "$FIX_HOME/state/demo-ship-verify.verify" \
+    "a failed handoff write must not pretend endpoint uncertainty was cleared"
+  pass "fm-verify: spawn handoff failures remain explicit and reconcilable"
+}
+
 test_build_failure_is_a_result_without_a_spawn() {
   new_fixture build-failure
   VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd 'exit 17' --artifact "$BUILD_ARTIFACT" 2>&1)
   VERIFY_RC=$?
   expect_code 0 "$VERIFY_RC" "a build failure is a verification result, not an orchestration failure"
@@ -494,7 +609,7 @@ test_build_failure_is_a_result_without_a_spawn() {
 test_artifact_path_cannot_escape_through_a_symlinked_parent() {
   new_fixture artifact-parent-escape
   VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd "ln -s '$FIX_PROJ' escaped" --artifact escaped/README.md 2>&1)
   VERIFY_RC=$?
   expect_code 1 "$VERIFY_RC" "a symlinked artifact parent that escapes source isolation must be refused"
@@ -509,7 +624,7 @@ test_artifact_path_cannot_escape_through_a_symlinked_parent() {
 test_artifact_descendant_symlink_must_stay_neutral() {
   new_fixture artifact-descendant-escape
   VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd "mkdir -p build/App && ln -s '$FIX_PROJ/README.md' build/App/source-link" \
     --artifact build/App 2>&1)
   VERIFY_RC=$?
@@ -526,7 +641,7 @@ test_artifact_internal_symlink_is_preserved() {
   local args neutral
   new_fixture artifact-internal-symlink
   VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd 'mkdir -p build/App/Versions/A && cp README.md build/App/Versions/A/app && ln -s A build/App/Versions/Current' \
     --artifact build/App 2>&1)
   VERIFY_RC=$?
@@ -544,7 +659,7 @@ test_cross_artifact_internal_symlink_is_preserved() {
   local args neutral
   new_fixture cross-artifact-internal-symlink
   VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd 'mkdir -p build/first build/second && ln -s ../second/payload build/first/to-payload && cp README.md build/second/payload' \
     --artifact build/first --artifact build/second 2>&1)
   VERIFY_RC=$?
@@ -569,7 +684,7 @@ exit 86
 SH
   chmod +x "$fakebin/perl"
   VERIFY_OUT=$(PATH="$fakebin:$PATH" TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" \
-    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" "$ROOT/bin/fm-verify.sh" demo-ship \
+    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify \
     --promise "$PROMISE" --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
   VERIFY_RC=$?
   expect_code 1 "$VERIFY_RC" "an unusable build runner must be an orchestration error"
@@ -586,7 +701,7 @@ SH
 test_build_timeout_is_not_a_product_verdict() {
   new_fixture build-timeout
   VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    FM_VERIFY_BUILD_TIMEOUT=1 "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    FM_VERIFY_BUILD_TIMEOUT=1 "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd 'sleep 5' --artifact "$BUILD_ARTIFACT" 2>&1)
   VERIFY_RC=$?
   expect_code 1 "$VERIFY_RC" "a locally imposed build timeout must be an orchestration error"
@@ -741,7 +856,7 @@ exec "$REAL_GIT_VERIFY" "$@"
 SH
   chmod +x "$fakebin/git"
   VERIFY_OUT=$(PATH="$fakebin:$PATH" TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" \
-    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" "$ROOT/bin/fm-verify.sh" demo-ship \
+    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify \
     --promise "$PROMISE" --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
   VERIFY_RC=$?
   expect_code 1 "$VERIFY_RC" "worktree allocation failure must be an orchestration error"
@@ -770,7 +885,7 @@ exec "$REAL_GIT_VERIFY" "$@"
 SH
   chmod +x "$fakebin/git"
   VERIFY_OUT=$(PATH="$fakebin:$PATH" TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" \
-    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" "$ROOT/bin/fm-verify.sh" demo-ship \
+    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify \
     --promise "$PROMISE" --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
   VERIFY_RC=$?
   expect_code 1 "$VERIFY_RC" "unconfirmed worktree cleanup must fail closed"
@@ -800,7 +915,7 @@ exec /bin/rm "$@"
 SH
   chmod +x "$fakebin/rm"
   VERIFY_OUT=$(PATH="$fakebin:$PATH" TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" \
-    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" "$ROOT/bin/fm-verify.sh" demo-ship \
+    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify \
     --promise "$PROMISE" --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
   VERIFY_RC=$?
   expect_code 1 "$VERIFY_RC" "an unconfirmed build-container cleanup must fail closed"
@@ -810,7 +925,7 @@ SH
   assert_contains "$VERIFY_OUT" "$container" \
     "the cleanup refusal must name the retained build container"
   retry_out=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
   retry_rc=$?
   expect_code 1 "$retry_rc" "a retained build container must block retry"
@@ -845,7 +960,7 @@ exec "$REAL_GIT_VERIFY" "$@"
 SH
   chmod +x "$fakebin/git"
   VERIFY_OUT=$(PATH="$fakebin:$PATH" TMPDIR="$alias_tmp" FM_HOME="$FIX_HOME" \
-    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" "$ROOT/bin/fm-verify.sh" demo-ship \
+    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify \
     --promise "$PROMISE" --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
   VERIFY_RC=$?
   expect_code 1 "$VERIFY_RC" "a locked partial-add record under a path alias must fail closed"
@@ -860,7 +975,7 @@ SH
 test_signal_terminated_build_is_a_product_failure() {
   new_fixture signaled-build
   VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd 'mkdir -p build && cp README.md build/app.txt && kill -TERM $$' \
     --artifact "$BUILD_ARTIFACT" 2>&1)
   VERIFY_RC=$?
@@ -879,7 +994,7 @@ test_interrupt_cleans_an_unpublished_reservation() {
   entered="$FIX_TMP/build-entered"
   out="$FIX_TMP/interrupted.out"
   TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd "touch '$entered'; while :; do sleep 1; done" --artifact "$BUILD_ARTIFACT" \
     > "$out" 2>&1 &
   pid=$!
@@ -932,7 +1047,7 @@ SH
   chmod +x "$fake_ps"
   TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
     FM_VERIFY_PS_OVERRIDE="$fake_ps" FM_VERIFY_TEST_TARGET_PID="$target_pid" \
-    FM_VERIFY_TEST_PS_SNAPSHOT="$snapshot" "$ROOT/bin/fm-verify.sh" demo-ship \
+    FM_VERIFY_TEST_PS_SNAPSHOT="$snapshot" "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify \
     --promise "$PROMISE" \
     --build-cmd "pwd > '$worktree_file'; '$helper' '$target_pid' & while :; do sleep 1; done" \
     --artifact "$BUILD_ARTIFACT" > "$out" 2>&1 &
@@ -969,7 +1084,7 @@ exec /bin/rm "\$@"
 SH
   chmod +x "$fakebin/rm"
   VERIFY_OUT=$(PATH="$fakebin:$PATH" TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" \
-    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" "$ROOT/bin/fm-verify.sh" demo-ship \
+    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify \
     --promise "$PROMISE" --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
   VERIFY_RC=$?
   expect_code 1 "$VERIFY_RC" "failed neutral cleanup must fail closed"
@@ -1000,7 +1115,7 @@ exec /bin/rm "$@"
 SH
   chmod +x "$fakebin/rm"
   VERIFY_OUT=$(PATH="$fakebin:$PATH" TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" \
-    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" "$ROOT/bin/fm-verify.sh" demo-ship \
+    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify \
     --promise "$PROMISE" \
     --build-cmd "mkdir -p build/App && ln -s '$FIX_PROJ/README.md' build/App/source-link" \
     --artifact build/App 2>&1)
@@ -1017,7 +1132,7 @@ SH
   [ -d "$neutral" ] || fail "the durable binding did not identify the retained neutral directory"
   [ -n "$identity" ] || fail "the durable binding did not retain the neutral directory identity"
   retry_out=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
   retry_rc=$?
   expect_code 1 "$retry_rc" "a retry must refuse an unreconciled neutral directory"
@@ -1053,7 +1168,7 @@ SH
   PATH="$fakebin:$PATH" TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" \
     FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" FM_VERIFY_TEST_NEUTRAL="$neutral" \
     FM_VERIFY_TEST_ENTERED="$entered" FM_VERIFY_TEST_RELEASE="$release" \
-    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" > "$out" 2>&1 &
   pid=$!
   wait_for_marker -e "$entered" || true
@@ -1069,7 +1184,7 @@ SH
     "$FIX_HOME/state/demo-ship-verify.verify")
   [ -n "$identity" ] || fail "the interrupted allocation did not retain its filesystem identity"
   retry_out=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
   retry_rc=$?
   expect_code 1 "$retry_rc" "a retry must refuse the interrupted neutral allocation"
@@ -1087,7 +1202,7 @@ test_retry_refuses_live_recorded_build_survivors() {
     "verifies=demo-ship" "build_cleanup_path=$FIX_TMP/removed-worktree" \
     "build_cleanup_pids=$survivor" "marker=retained"
   retry_out=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
-    "$ROOT/bin/fm-verify.sh" demo-ship --promise "$PROMISE" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
   retry_rc=$?
   kill -TERM "$survivor" 2>/dev/null || true
@@ -1151,10 +1266,13 @@ test_capacity_defers_and_never_skips
 test_capacity_ignores_finished_verifications
 test_capacity_counts_a_pre_spawn_reservation
 test_concurrent_admission_keeps_one_available_slot
+test_concurrent_same_id_reservation_is_exclusive
+test_default_id_rolls_forward_with_the_revision
 test_spawn_failure_with_unknown_endpoint_retains_artifacts
 test_uncertain_endpoint_holds_capacity
-test_spawn_failure_preserves_an_existing_data_directory
+test_existing_report_refuses_id_reuse
 test_partial_spawn_retains_reconciliation_artifacts
+test_spawn_handoff_persistence_failure_is_reported
 test_build_failure_is_a_result_without_a_spawn
 test_artifact_path_cannot_escape_through_a_symlinked_parent
 test_artifact_descendant_symlink_must_stay_neutral

@@ -198,6 +198,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-busy-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# shellcheck source=bin/fm-neutral-dir-lib.sh
+. "$SCRIPT_DIR/fm-neutral-dir-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -1000,25 +1002,11 @@ real_path_or_raw() {  # <path>
   fi
 }
 
-path_is_same_or_descendant_by_identity() {  # <path> <ancestor>
-  local current=$1 ancestor=$2 parent
-  [ -d "$current" ] && [ -d "$ancestor" ] || return 1
-  current=$(CDPATH='' cd -- "$current" && pwd -P) || return 1
-  ancestor=$(CDPATH='' cd -- "$ancestor" && pwd -P) || return 1
-  while :; do
-    [ "$current" -ef "$ancestor" ] && return 0
-    parent=$(CDPATH='' cd -- "$current/.." && pwd -P) || return 1
-    [ "$parent" -ef "$current" ] && return 1
-    current=$parent
-  done
-}
-
 filesystem_identity() {
   stat -f '%d:%i' "$1" 2>/dev/null || stat -c '%d:%i' "$1" 2>/dev/null
 }
 
 validate_neutral_launch_directory() {
-  local protected candidate
   [ -d "$WT" ] || { echo "error: neutral launch directory is not a directory: $WT" >&2; return 1; }
   [ ! -L "$WT" ] || { echo "error: neutral launch directory must not be a symlink: $WT" >&2; return 1; }
   if git -C "$WT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
@@ -1026,23 +1014,10 @@ validate_neutral_launch_directory() {
     echo "error: neutral launch directory must not be a git repository or worktree: $WT" >&2
     return 1
   fi
-  for protected in "$PROJ_ABS" "$FM_ROOT" "$FM_HOME"; do
-    [ -d "$protected" ] || continue
-    if path_is_same_or_descendant_by_identity "$WT" "$protected" \
-       || path_is_same_or_descendant_by_identity "$protected" "$WT"; then
-      echo "error: neutral launch directory must be outside protected project and firstmate paths: $WT" >&2
-      return 1
-    fi
-  done
-  if [ -d "$PROJECTS" ]; then
-    for candidate in "$PROJECTS"/*; do
-      [ -d "$candidate" ] || continue
-      if path_is_same_or_descendant_by_identity "$WT" "$candidate" \
-         || path_is_same_or_descendant_by_identity "$candidate" "$WT"; then
-        echo "error: neutral launch directory must be outside every project clone: $WT" >&2
-        return 1
-      fi
-    done
+  if fm_neutral_directory_conflicts_with_protected_path \
+      "$WT" "$PROJ_ABS" "$FM_ROOT" "$FM_HOME" "$PROJECTS"; then
+    echo "error: neutral launch directory must be outside protected project and firstmate paths: $WT" >&2
+    return 1
   fi
 }
 
