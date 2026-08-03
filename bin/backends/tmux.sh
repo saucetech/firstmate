@@ -47,8 +47,9 @@ fm_backend_tmux_send_key() {  # <target> <key>
 }
 
 # fm_backend_tmux_send_text_submit: type <text> into <target> once, then
-# submit with Enter, retried (Enter only, never retyped) until the composer
-# clears. The backend-only expected-label slot is skipped while the optional
+# submit with Enter, retried (Enter only, never retyped) within the caller's
+# budget and verified by the shared submit core.
+# The backend-only expected-label slot is skipped while the optional
 # harness is forwarded to fm_tmux_submit_core; see that file for the
 # composer-verification contract and echoed verdicts.
 fm_backend_tmux_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle> [expected-label] [harness]

@@ -13,8 +13,8 @@
 # as "pending input" and the away-mode daemon deferred 100% of escalations for
 # 9.5 hours with no escape. The detector below strips the box borders before
 # deciding, so a bordered-but-empty composer is correctly seen as empty. The same
-# corrected detector backs the submit acknowledgement (a submit "landed" iff the
-# composer is empty afterward), fixing the parallel false "Enter swallowed".
+# corrected detector backs the normal cleared-composer submit acknowledgement,
+# fixing the parallel false "Enter swallowed".
 #
 # Ghost text (incident composer-robust): claude renders a predicted-next-prompt
 # "suggestion" as dim/faint text inside an otherwise-empty composer. A plain
@@ -407,10 +407,10 @@ fm_tmux_harness_supports_busy_queued_enter() {  # <harness>
 }
 
 # fm_tmux_submit_core: type <text> into <target> ONCE, then submit with Enter,
-# verifying the composer cleared. Retries Enter ONLY — never retypes, because a
-# swallowed Enter leaves our text in the composer and retyping would duplicate
-# it. Echoes the final proof-carrying verdict on stdout so callers can require
-# exact `empty` before treating submission as confirmed.
+# verifying delivery under the header-owned contract. Retries Enter ONLY — never
+# retypes, because a swallowed Enter leaves our text in the composer and retyping
+# would duplicate it. Echoes the final proof-carrying verdict on stdout so callers
+# can require exact `empty` before treating submission as confirmed.
 # The header's busy-queued Enter capability contract owns when a rendered busy
 # footer is sufficient submit proof. Pending-unproven receives the same Enter
 # retry budget but never reaches this exception.
