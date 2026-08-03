@@ -29,6 +29,10 @@
 # declared scratch and the report at data/<task-id>/report.md is the work
 # product. Teardown proceeds only once the report exists and the shared
 # unresolved-decision completion gate verifies its captain-held inventory.
+# Verifier scouts use launch_mode=neutral instead of a worktree. Teardown removes
+# their scratch directory only after the recorded endpoint is confirmed absent and
+# the directory still matches its durable verifier binding and filesystem identity;
+# otherwise it preserves the directory and every ownership record for reconciliation.
 # Before destructive cleanup, teardown validates task check artifacts and any
 # matching quarantine entries as ordinary single-link files on the state
 # device. It refuses and preserves task state when that proof fails; otherwise

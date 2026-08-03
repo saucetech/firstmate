@@ -94,7 +94,7 @@ state/               volatile runtime signals; gitignored
   <id>.herdr-presentation  quarantinable attempt and restart-binding journal for Herdr's optional visual projection; never task or endpoint authority; see docs/herdr-backend.md "Optional presentation spaces"
   <id>.check.sh      authenticated slow poll; the watcher dispatches validated PR data and the byte-identified X shim through trusted repository scripts, runs registered custom checks from hash-validated private snapshots, and rejects every other state check without execution
   <id>.check-trust   private content binding created by fm-check-register.sh for an intentional custom check
-  <id>.verify        written by fm-verify: verifies=, rev=, rev_source=, project=, promise=, created=; binds a verifier task to the ship task, revision, and promise whose merge its verdict gates (section 7)
+  <id>.verify        private durable verifier binding and retained-cleanup ownership; binds a verifier task to the ship task, revision, and promise whose merge its verdict gates; bin/fm-verify.sh owns the exact fields and lifecycle (section 7)
   <id>.pr-poll       private validated data sidecar for the byte-static PR merge poll
   <id>.pr-poll-registration  private transactional provenance record binding the task, canonical metadata identity, sidecar, and static poll publication
   <id>.pr-poll-retirement  private identity-bound crash-recovery receipt for one exact validated merged result; removed after its poll artifacts retire
@@ -331,7 +331,7 @@ The worker reports the PR when CI first becomes green rather than waiting for me
 
 ### Verify
 
-Between validation and PR-ready, a finished ship change is checked by an independent verifier that uses the product as its user would; `bin/fm-verify.sh` and its help own promise authoring, revision resolution, binding, and capacity mechanics.
+After implementation and any applicable validation finish, a covered ship change is checked before merge by an independent verifier that uses the product as its user would; `bin/fm-verify.sh` and its help own promise authoring, revision resolution, binding, and capacity mechanics.
 
 Verify every ship change before it merges unless the whole change is confined to this closed list: refactors with no behavior change, test-only changes, documentation, build or CI tooling, and comments.
 Anything outside that list is verified, and a change that mixes both is verified.

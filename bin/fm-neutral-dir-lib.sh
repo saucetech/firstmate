@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Authorize verifier neutral-directory use and removal by durable path and
+# filesystem identity while excluding repository, operational-home, and other
+# caller-supplied protected path trees in either ancestor direction.
 
 fm_path_is_same_or_descendant_by_identity() {
   local current=$1 ancestor=$2 parent

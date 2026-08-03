@@ -43,7 +43,7 @@ Launching a supported harness inside it instantiates your first mate - and makes
 
 - **One liaison** - you talk only to the first mate; it dispatches, supervises, escalates only real decisions, and reports plain outcomes.
 - **A visible crew** - every crewmate works in its own tmux window, experimental herdr/zellij tab, cmux workspace, or Orca terminal you can watch or type into; the first mate reconciles.
-- **Disposable worktrees** - each task runs in a clean [treehouse](https://github.com/kunchenguid/treehouse) git worktree, or an Orca-managed worktree when `backend=orca`, so parallel work on one repo never collides.
+- **Disposable worktrees** - each ship or ordinary scout runs in a clean [treehouse](https://github.com/kunchenguid/treehouse) git worktree, or an Orca-managed worktree when `backend=orca`, while independent verifiers receive only built artifacts in neutral scratch directories.
 - **Two task shapes** - ship tasks deliver authorized changes; scout tasks leave standalone investigation reports when the intake contract warrants separate research.
 - **Explicit project modes** - each project ships via `no-mistakes`, `direct-PR`, or `local-only`, with an optional `+yolo` autonomy flag.
 - **Independent delivery verification** - before eligible ship changes merge, a separate scratch worker exercises the finished product as its ideal user and reports whether the promised result is actually delivered.
@@ -149,7 +149,7 @@ Setup guides for tmux (the default) and every other supported backend (herdr, ze
  │crewmate│   │crewmate│      │crewmate│   one autonomous agent each
  └───┬────┘   └───┬────┘      └───┬────┘
      ▼            ▼               ▼
-  treehouse worktree, Orca worktree, or isolated secondmate home
+  treehouse worktree, Orca worktree, neutral verifier directory, or isolated secondmate home
      │
      ├─ ship: project mode ► user verification when required ► PR/local merge ► teardown
      │
