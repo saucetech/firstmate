@@ -495,6 +495,7 @@ FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes run rows scanned when axi sta
 FM_CREW_STATE_BIN=bin/fm-crew-state.sh   # test override for the current-state reader used by working/paused watcher triage
 FM_VERIFY_BUILD_TIMEOUT=1800   # seconds allowed for a verifier's detached build; bin/fm-verify.sh --help owns build behavior
 FM_VERIFY_MAX_CONCURRENT=2   # maximum live verifier tasks; bin/fm-verify.sh --help owns capacity behavior
+FM_VERIFY_READINESS_POLLS=40   # extra process-table samples the verifier build runner may take while waiting for its own forked leader to become observable; bin/fm-verify.sh --help owns runner behavior
 FMX_PAIRING_TOKEN=      # X mode pairing token; .env opt-in authorizes replies and eligible lifecycle actions
 FMX_RELAY_URL=https://myfirstmate.io   # optional X relay override, mainly for local relay development
 FMX_ENV_FILE=           # optional alternate .env file for direct X client invocations; bootstrap still checks $FM_HOME/.env
