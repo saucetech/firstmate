@@ -21,6 +21,8 @@
 # FM_VERIFY_BUILD_TIMEOUT bounds the build in seconds and defaults to 1800.
 # FM_VERIFY_MAX_CONCURRENT defaults to 2. Reaching capacity delays verification;
 # it never exempts one. FM_VERIFY_SPAWN_OVERRIDE replaces fm-spawn.sh for tests.
+# FM_VERIFY_READINESS_POLLS defaults to 40 and bounds how long the build runner
+# waits for its own forked leader to appear in the process table before refusing.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,6 +42,10 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 SPAWN_CMD=${FM_VERIFY_SPAWN_OVERRIDE:-$SCRIPT_DIR/fm-spawn.sh}
 MAX_CONCURRENT=${FM_VERIFY_MAX_CONCURRENT:-2}
 BUILD_TIMEOUT=${FM_VERIFY_BUILD_TIMEOUT:-1800}
+# How many extra process-table samples the runner may take while waiting for the
+# freshly forked build leader to become observable. See the readiness gate in
+# run_build_with_timeout for why one sample is not enough.
+READINESS_POLLS=${FM_VERIFY_READINESS_POLLS:-40}
 
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
@@ -53,6 +59,9 @@ case "$MAX_CONCURRENT" in
 esac
 case "$BUILD_TIMEOUT" in
   ''|*[!0-9]*|0) echo "error: FM_VERIFY_BUILD_TIMEOUT must be a positive integer" >&2; exit 2 ;;
+esac
+case "$READINESS_POLLS" in
+  ''|*[!0-9]*) echo "error: FM_VERIFY_READINESS_POLLS must be a non-negative integer" >&2; exit 2 ;;
 esac
 
 PROMISE=
@@ -690,6 +699,7 @@ run_build_with_timeout() {
     $timeout = shift @ARGV;
     $ps_bin = shift @ARGV;
     $lsof_bin = shift @ARGV;
+    $readiness_max_polls = shift @ARGV;
     $runner_started = time;
     $publish = sub {
       $value = shift;
@@ -1028,7 +1038,43 @@ run_build_with_timeout() {
     alarm $timeout;
     ($live, $refresh_error) = $refresh_descendants->();
     $stop->("error:$refresh_error") unless defined($live);
-    $stop->("error:readiness-leader-missing") unless exists($tracked_start{$pid});
+    # NOTE: this program is single-quoted shell text, so it must contain no
+    # apostrophes anywhere, comments included.
+    #
+    # The leader is forked and parked on the readiness byte, so it genuinely
+    # exists here: it cannot have reached exec yet, and had it died on the way
+    # to that read it would be an unreaped zombie, which ps still reports. A
+    # snapshot is a SAMPLE of the process table, though, not an instantaneous
+    # truth, so on a loaded host one sample can omit a process that is provably
+    # alive. Treating a single miss as fatal turned that sampling artifact into
+    # a false "BLOCKED: the build runner failed before the product could be
+    # exercised: readiness-leader-missing" that aborted real verifications on CI,
+    # landing on whichever test lost the race rather than on any real defect.
+    # Re-observe on a bounded budget instead. This does NOT weaken the gate: a
+    # leader that never becomes observable still refuses below, because every
+    # later drain and lineage decision depends on tracking that started from a
+    # trustworthy observation. Do not collapse this back to a single sample to
+    # make a red suite green - the flake is in the sampling, not in the product.
+    $readiness_polls = 0;
+    while (!exists($tracked_start{$pid})) {
+      if ($readiness_polls >= $readiness_max_polls) {
+        # Giving up has to release the leader first. It is parked on the
+        # readiness byte and was never tracked, so $terminate_all sees an empty
+        # live set and signals nothing, and the blocking waitpid inside $stop
+        # would then wait forever on a child that is itself waiting on us - a
+        # hang instead of the refusal this gate exists to produce. Closing the
+        # readiness channel ends that read through the same protocol the leader
+        # already follows, before any exec, and the signal is a backstop for a
+        # leader wedged somewhere else.
+        close($ready_write);
+        kill "TERM", $pid;
+        $stop->("error:readiness-leader-missing");
+      }
+      $readiness_polls++;
+      select undef, undef, undef, 0.05;
+      ($live, $refresh_error) = $refresh_descendants->();
+      $stop->("error:$refresh_error") unless defined($live);
+    }
     for $candidate (keys %{$processes}) {
       next unless $processes->{$candidate}->{uid} == $runner_uid;
       $baseline_start{$candidate} = $processes->{$candidate}->{start};
@@ -1100,7 +1146,7 @@ run_build_with_timeout() {
     $exit_code = $status >> 8;
     $publish->("drained:exit:$exit_code") or exit 125;
     exit($exit_code);
-  ' "$BUILD_TIMEOUT" "$PS_BIN" "$LSOF_BIN" /bin/bash -lc "$BUILD_CMD"
+  ' "$BUILD_TIMEOUT" "$PS_BIN" "$LSOF_BIN" "$READINESS_POLLS" /bin/bash -lc "$BUILD_CMD"
 }
 
 # shellcheck disable=SC2016  # single quotes are deliberate: these are Perl program texts whose $variables must reach perl unexpanded, not shell expansions.

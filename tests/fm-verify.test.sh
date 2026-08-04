@@ -698,6 +698,94 @@ SH
   pass "fm-verify: reports an unusable runner without blaming the product"
 }
 
+# The build runner gates itself on seeing its own freshly forked leader in the
+# process table before releasing it to exec. That leader provably exists at that
+# point, but a `ps` snapshot is a SAMPLE, not an instantaneous truth: on a loaded
+# host one sample can omit a live process. The runner used to take exactly one
+# sample and treat a miss as fatal, which turned that sampling artifact into
+# "BLOCKED: ... readiness-leader-missing" - a false orchestration failure that
+# aborted real verifications on CI and landed on whichever test lost the race.
+# The fake ps here drops the leader from the FIRST snapshot only, which is
+# precisely that transient, and pins that the runner re-observes rather than
+# blaming the product. Do not relax this into "the first sample must be right".
+test_transient_process_table_miss_is_re_observed() {
+  local fake_ps counter calls
+  new_fixture readiness-transient-miss
+  fake_ps="$FIX_TMP/fake-ps"
+  counter="$FIX_TMP/ps-calls"
+  : > "$counter"
+  cat > "$fake_ps" <<'SH'
+#!/usr/bin/env bash
+# First call answers with a table that cannot contain the caller's leader, so
+# the runner sees the exact transient a loaded host produces. Later calls are
+# the real table, so the leader becomes observable and the build proceeds.
+printf 'x\n' >> "$FM_VERIFY_TEST_PS_COUNTER"
+if [ "$(wc -l < "$FM_VERIFY_TEST_PS_COUNTER")" -le 1 ]; then
+  /bin/ps -o pid=,ppid=,pgid=,uid=,state=,etime=,lstart= -p 1 2>/dev/null
+  exit 0
+fi
+exec /bin/ps "$@"
+SH
+  chmod +x "$fake_ps"
+  VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
+    FM_VERIFY_PS_OVERRIDE="$fake_ps" FM_VERIFY_TEST_PS_COUNTER="$counter" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
+    --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
+  VERIFY_RC=$?
+  case "$VERIFY_OUT" in
+    *readiness-leader-missing*)
+      fail "one missed process-table sample still blocked the build (got: $VERIFY_OUT)" ;;
+  esac
+  expect_code 0 "$VERIFY_RC" \
+    "a transient process-table miss must not fail the verification (got: $VERIFY_OUT)"
+  calls=$(wc -l < "$counter" | tr -d ' ')
+  [ "$calls" -ge 2 ] || fail "the runner never re-observed the process table (ps calls: $calls)"
+  [ -s "$FIX_SPAWN_LOG" ] || fail "a recovered readiness observation must still reach the verifier spawn"
+  pass "fm-verify: a transient process-table miss is re-observed, not blamed on the product"
+}
+
+# A leader that never becomes observable is a real orchestration failure, not a
+# transient. The bounded re-observation above must not turn this into a hang or,
+# worse, into a build that proceeds on tracking it cannot trust.
+test_permanently_unobservable_leader_still_refuses() {
+  local fake_ps out pid watchdog
+  new_fixture readiness-never-observable
+  fake_ps="$FIX_TMP/fake-ps"
+  out="$FIX_TMP/never-observable.out"
+  cat > "$fake_ps" <<'SH'
+#!/usr/bin/env bash
+# Never reports anything but pid 1, so the leader is never observable.
+/bin/ps -o pid=,ppid=,pgid=,uid=,state=,etime=,lstart= -p 1 2>/dev/null
+exit 0
+SH
+  chmod +x "$fake_ps"
+  TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
+    FM_VERIFY_PS_OVERRIDE="$fake_ps" FM_VERIFY_READINESS_POLLS=3 \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
+    --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" > "$out" 2>&1 &
+  pid=$!
+  # Watchdogged deliberately. Giving up here used to block forever in waitpid on
+  # a leader that was itself waiting for a readiness byte, so the regression this
+  # pins is a HANG. Without the bound it would eat the whole CI job and read as
+  # an infrastructure problem; with it, the regression fails in seconds and says
+  # what it was.
+  ( sleep 60; kill -KILL "$pid" 2>/dev/null ) &
+  watchdog=$!
+  wait "$pid"; VERIFY_RC=$?
+  kill "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  [ "$VERIFY_RC" -ne 137 ] || \
+    fail "an unobservable build leader hung the runner instead of refusing"
+  VERIFY_OUT=$(cat "$out")
+  expect_code 1 "$VERIFY_RC" "an unobservable build leader must remain an orchestration failure"
+  assert_contains "$VERIFY_OUT" "readiness-leader-missing" \
+    "the refusal must still name the unobservable leader"
+  assert_absent "$FIX_HOME/data/demo-ship-verify/report.md" \
+    "an unobservable leader must not write a product verdict"
+  [ ! -s "$FIX_SPAWN_LOG" ] || fail "an unobservable leader must stop before verifier spawn"
+  pass "fm-verify: a leader that never becomes observable still refuses"
+}
+
 test_build_timeout_is_not_a_product_verdict() {
   new_fixture build-timeout
   VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
@@ -1279,6 +1367,8 @@ test_artifact_descendant_symlink_must_stay_neutral
 test_artifact_internal_symlink_is_preserved
 test_cross_artifact_internal_symlink_is_preserved
 test_unusable_build_runner_is_not_a_product_verdict
+test_transient_process_table_miss_is_re_observed
+test_permanently_unobservable_leader_still_refuses
 test_build_timeout_is_not_a_product_verdict
 test_build_cannot_forge_runner_status
 test_build_descendants_are_drained_before_staging
