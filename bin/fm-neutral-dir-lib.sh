@@ -17,7 +17,7 @@ fm_path_is_same_or_descendant_by_identity() {
 }
 
 fm_neutral_filesystem_identity() {
-  stat -f '%d:%i' "$1" 2>/dev/null || stat -c '%d:%i' "$1" 2>/dev/null
+  stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1" 2>/dev/null
 }
 
 fm_neutral_binding_value() {

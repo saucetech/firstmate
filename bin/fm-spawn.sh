@@ -1002,7 +1002,7 @@ real_path_or_raw() {  # <path>
 }
 
 filesystem_identity() {
-  stat -f '%d:%i' "$1" 2>/dev/null || stat -c '%d:%i' "$1" 2>/dev/null
+  fm_neutral_filesystem_identity "$1"
 }
 
 validate_neutral_launch_directory() {

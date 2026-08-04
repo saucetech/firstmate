@@ -514,7 +514,7 @@ SH
 
 write_neutral_binding() {
   local binding=$1 target=$2 identity=${3:-}
-  [ -n "$identity" ] || identity=$(stat -f '%d:%i' "$target" 2>/dev/null || stat -c '%d:%i' "$target")
+  [ -n "$identity" ] || identity=$(stat -c '%d:%i' "$target" 2>/dev/null || stat -f '%d:%i' "$target")
   fm_write_meta "$binding" \
     "verifies=ship-x1" \
     "neutral_cleanup_path=$target" \
@@ -1660,7 +1660,7 @@ test_neutral_teardown_refuses_replaced_directory_identity() {
   neutral="$case_dir/neutral-verifier"
   retained="$case_dir/original-neutral-verifier"
   mkdir -p "$neutral"
-  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
   fm_write_meta "$case_dir/state/task-x1.meta" \
     "window=firstmate:fm-task-x1" \
     "endpoint_task_id=task-x1" \
@@ -1690,7 +1690,7 @@ test_neutral_teardown_retains_records_when_removal_fails() {
   case_dir=$(make_case neutral-removal-failure)
   neutral="$case_dir/neutral-verifier"
   mkdir -p "$neutral"
-  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
   fm_write_meta "$case_dir/state/task-x1.meta" \
     "window=firstmate:fm-task-x1" \
     "endpoint_task_id=task-x1" \
@@ -1721,7 +1721,7 @@ test_neutral_teardown_retains_records_when_endpoint_absence_is_unconfirmed() {
   case_dir=$(make_case neutral-endpoint-unconfirmed)
   neutral="$case_dir/neutral-verifier"
   mkdir -p "$neutral"
-  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
   fm_write_meta "$case_dir/state/task-x1.meta" \
     "window=firstmate:fm-task-x1" \
     "endpoint_task_id=task-x1" \
@@ -1760,7 +1760,7 @@ test_neutral_teardown_allows_directory_beneath_operator_home() {
   operator_home="$case_dir/operator-home"
   neutral="$operator_home/tmp/neutral-verifier"
   mkdir -p "$neutral"
-  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
   fm_write_meta "$case_dir/state/task-x1.meta" \
     "window=firstmate:fm-task-x1" \
     "endpoint_task_id=task-x1" \
@@ -1785,7 +1785,7 @@ test_neutral_teardown_refuses_an_unbound_directory() {
   case_dir=$(make_case neutral-unbound)
   neutral="$case_dir/neutral-verifier"
   mkdir -p "$neutral"
-  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
   fm_write_meta "$case_dir/state/task-x1.meta" \
     "window=firstmate:fm-task-x1" \
     "endpoint_task_id=task-x1" \
@@ -1811,7 +1811,7 @@ test_neutral_teardown_refuses_a_mismatched_binding_identity() {
   case_dir=$(make_case neutral-binding-mismatch)
   neutral="$case_dir/neutral-verifier"
   mkdir -p "$neutral"
-  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
   fm_write_meta "$case_dir/state/task-x1.meta" \
     "window=firstmate:fm-task-x1" \
     "endpoint_task_id=task-x1" \
@@ -1843,7 +1843,7 @@ test_forced_secondmate_teardown_removes_neutral_child() {
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects" "$neutral"
   printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
   printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
-  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
   fm_write_meta "$home/state/child-neutral.meta" \
     "window=firstmate:fm-child-neutral" \
     "endpoint_task_id=child-neutral" \
@@ -1879,7 +1879,7 @@ assert_forced_secondmate_refuses_parent_protected_neutral() {
     *) fail "unknown parent protected kind: $protected_kind" ;;
   esac
   printf '%s\n' keep > "$neutral/must-survive"
-  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
   fm_write_meta "$home/state/child-neutral.meta" \
     "window=firstmate:fm-child-neutral" \
     "endpoint_task_id=child-neutral" \
@@ -1922,7 +1922,7 @@ test_forced_secondmate_retains_neutral_child_when_removal_fails() {
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects" "$neutral"
   printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
   printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
-  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
   fm_write_meta "$home/state/child-neutral.meta" \
     "window=firstmate:fm-child-neutral" \
     "endpoint_task_id=child-neutral" \
@@ -1959,7 +1959,7 @@ test_forced_secondmate_retains_neutral_child_when_endpoint_is_unconfirmed() {
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects" "$neutral"
   printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
   printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
-  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
   fm_write_meta "$home/state/child-neutral.meta" \
     "window=firstmate:fm-child-neutral" \
     "endpoint_task_id=child-neutral" \

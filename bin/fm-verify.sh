@@ -1148,7 +1148,7 @@ neutral_symlinks_stay_inside() {
 
 PERL_BIN=$(command -v perl 2>/dev/null || true)
 PS_BIN=${FM_VERIFY_PS_OVERRIDE:-/bin/ps}
-LSOF_BIN=${FM_VERIFY_LSOF_OVERRIDE:-/usr/sbin/lsof}
+LSOF_BIN=${FM_VERIFY_LSOF_OVERRIDE:-$(command -v lsof 2>/dev/null || true)}
 if [ -z "$PERL_BIN" ] || [ ! -x "$PERL_BIN" ] \
    || ! "$PERL_BIN" -MFcntl=F_GETFD,F_SETFD,FD_CLOEXEC,F_GETFL,F_SETFL,O_NONBLOCK -MErrno=EAGAIN,EWOULDBLOCK -MFile::Temp=tempfile -MCwd=abs_path -e 'exit 0' >/dev/null 2>&1 \
    || [ ! -x /bin/bash ] || [ ! -x "$PS_BIN" ] || [ ! -x "$LSOF_BIN" ]; then

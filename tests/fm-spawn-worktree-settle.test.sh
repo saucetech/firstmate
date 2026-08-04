@@ -102,7 +102,7 @@ run_settle_spawn() {
 
 write_neutral_binding() {
   local binding=$1 target=$2 identity=${3:-}
-  [ -n "$identity" ] || identity=$(stat -f '%d:%i' "$target" 2>/dev/null || stat -c '%d:%i' "$target")
+  [ -n "$identity" ] || identity=$(stat -c '%d:%i' "$target" 2>/dev/null || stat -f '%d:%i' "$target")
   fm_write_meta "$binding" \
     "verifies=ship-x1" \
     "neutral_cleanup_path=$target" \
@@ -206,7 +206,7 @@ test_neutral_mode_records_directory_identity() {
     "$SPAWN" "$id" "$PROJ_DIR" --scout --neutral-dir "$neutral" 2>&1)
   status=$?
   expect_code 0 "$status" "neutral mode must launch from an isolated ordinary directory (got: $out)"
-  identity=$(stat -f '%d:%i' "$neutral" 2>/dev/null || stat -c '%d:%i' "$neutral")
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
   assert_grep "launch_mode=neutral" "$HOME_DIR/state/$id.meta" \
     "neutral task metadata must identify its teardown mode"
   assert_grep "neutral_identity=$identity" "$HOME_DIR/state/$id.meta" \
