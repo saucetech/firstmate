@@ -1754,6 +1754,83 @@ SH
   pass "neutral teardown retains records until endpoint absence is confirmed"
 }
 
+# A tmux server that is not running provably holds no window, so it is confirmed
+# ABSENCE, exactly as a missing zellij session and a missing cmux workspace
+# already are. Treating every non-zero `tmux list-windows` as "cannot tell" left
+# the neutral directory, the task metadata, and the verifier binding stranded
+# forever once the operator killed the firstmate session, with no recovery short
+# of starting a tmux server by hand. Absence detection is three-way now: only a
+# genuine inventory failure is undetermined.
+test_neutral_teardown_confirms_absence_when_no_tmux_server_runs() {
+  local case_dir neutral identity rc
+  case_dir=$(make_case neutral-endpoint-no-tmux-server)
+  neutral="$case_dir/neutral-verifier"
+  mkdir -p "$neutral"
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "window=firstmate:fm-task-x1" \
+    "endpoint_task_id=task-x1" \
+    "worktree=$neutral" \
+    "project=$case_dir/project" \
+    "kind=scout" \
+    "mode=local-only" \
+    "launch_mode=neutral" \
+    "neutral_identity=$identity"
+  write_neutral_binding "$case_dir/state/task-x1.verify" "$neutral" "$identity"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-windows) echo "no server running on /tmp/tmux-501/default" >&2; exit 1 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" \
+    "no tmux server: a dead server proves the window gone, so teardown must proceed: $(cat "$case_dir/stderr")"
+  [ ! -e "$neutral" ] || fail "no tmux server: the neutral verifier directory was stranded"
+  [ ! -e "$case_dir/state/task-x1.meta" ] || fail "no tmux server: task metadata was stranded"
+  pass "neutral teardown retires a verifier whose tmux server is no longer running"
+}
+
+# The narrowing above must not widen what counts as safe to delete: an inventory
+# failure that does not prove the server gone is still undetermined and refuses.
+test_neutral_teardown_refuses_an_unreadable_tmux_inventory() {
+  local case_dir neutral identity rc
+  case_dir=$(make_case neutral-endpoint-tmux-unreadable)
+  neutral="$case_dir/neutral-verifier"
+  mkdir -p "$neutral"
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "window=firstmate:fm-task-x1" \
+    "endpoint_task_id=task-x1" \
+    "worktree=$neutral" \
+    "project=$case_dir/project" \
+    "kind=scout" \
+    "mode=local-only" \
+    "launch_mode=neutral" \
+    "neutral_identity=$identity"
+  write_neutral_binding "$case_dir/state/task-x1.verify" "$neutral" "$identity"
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-windows) echo "tmux: invalid option -- Z" >&2; exit 1 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tmux"
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "unreadable tmux inventory: teardown reported success"
+  [ -d "$neutral" ] || fail "unreadable tmux inventory: verifier directory was deleted"
+  [ -e "$case_dir/state/task-x1.meta" ] || fail "unreadable tmux inventory: task metadata was erased"
+  [ -e "$case_dir/state/task-x1.verify" ] || fail "unreadable tmux inventory: verifier binding was erased"
+  assert_grep "absence is not confirmed for neutral task task-x1 at $neutral" "$case_dir/stderr" \
+    "unreadable tmux inventory: refusal must name uncertainty, the task, and the retained path"
+  pass "neutral teardown still refuses when the tmux inventory cannot be read"
+}
+
 test_neutral_teardown_allows_directory_beneath_operator_home() {
   local case_dir operator_home neutral identity
   case_dir=$(make_case neutral-beneath-operator-home)
@@ -2208,6 +2285,8 @@ test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed
 test_neutral_teardown_refuses_replaced_directory_identity
 test_neutral_teardown_retains_records_when_removal_fails
 test_neutral_teardown_retains_records_when_endpoint_absence_is_unconfirmed
+test_neutral_teardown_confirms_absence_when_no_tmux_server_runs
+test_neutral_teardown_refuses_an_unreadable_tmux_inventory
 test_neutral_teardown_allows_directory_beneath_operator_home
 test_neutral_teardown_refuses_an_unbound_directory
 test_neutral_teardown_refuses_a_mismatched_binding_identity

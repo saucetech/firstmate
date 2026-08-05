@@ -23,6 +23,9 @@
 # it never exempts one. FM_VERIFY_SPAWN_OVERRIDE replaces fm-spawn.sh for tests.
 # FM_VERIFY_READINESS_POLLS defaults to 40 and bounds how long the build runner
 # waits for its own forked leader to appear in the process table before refusing.
+# FM_VERIFY_PS_OVERRIDE replaces /bin/ps and FM_VERIFY_LSOF_OVERRIDE replaces
+# lsof for tests; both are the seams that let the suite drive the build runner's
+# descendant-containment paths without spawning real long-lived processes.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,6 +56,15 @@ READINESS_POLLS=${FM_VERIFY_READINESS_POLLS:-40}
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-neutral-dir-lib.sh
+. "$SCRIPT_DIR/fm-neutral-dir-lib.sh"
+# shellcheck source=bin/fm-gate-refuse-lib.sh
+. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+# Fail closed before any fleet mutation: this is a fleet-lifecycle entrypoint
+# like fm-spawn/fm-send/fm-teardown, so a no-mistakes gate agent must be turned
+# away here rather than after it has bound a verification, created a detached
+# build worktree, and run an arbitrary --build-cmd (bin/fm-gate-refuse-lib.sh).
+fm_refuse_if_gate_agent
 
 case "$MAX_CONCURRENT" in
   ''|*[!0-9]*) echo "error: FM_VERIFY_MAX_CONCURRENT must be a non-negative integer" >&2; exit 2 ;;
@@ -527,7 +539,7 @@ cleanup_build_worktree() {
 remove_unpublished_neutral_directory() {
   local target=$1 current_identity
   [ -n "$target" ] || return 0
-  current_identity=$(fm_pr_file_identity "$target") || {
+  current_identity=$(fm_neutral_filesystem_identity "$target") || {
     echo "BLOCKED: neutral verifier directory identity could not be read for $target; verifier binding was retained for reconciliation" >&2
     return 1
   }
@@ -1226,7 +1238,7 @@ if ! printf 'neutral_cleanup_path=%s\n' "$NEUTRAL_DIR" >> "$VERIFY_SIDECAR" \
   echo "BLOCKED: could not immediately publish neutral-directory ownership for ${NEUTRAL_DIR:-the removed allocation}" >&2
   exit 1
 fi
-NEUTRAL_IDENTITY=$(fm_pr_file_identity "$NEUTRAL_DIR") || {
+NEUTRAL_IDENTITY=$(fm_neutral_filesystem_identity "$NEUTRAL_DIR") || {
   echo "BLOCKED: could not bind the neutral artifact directory identity at $NEUTRAL_DIR" >&2
   exit 1
 }
@@ -1359,10 +1371,17 @@ for artifact in "${ARTIFACTS[@]}"; do
     echo "BLOCKED: configured artifact path escapes the detached build worktree: $artifact -> ${component_result:-unresolved component}" >&2
     exit 1
   fi
+  # A build that exited 0 and left no artifact is indistinguishable here from a
+  # mistyped or stale --artifact path: fm-verify cannot tell operator
+  # misconfiguration from a build that silently produced nothing, so it must not
+  # claim to. This reports BLOCKED like every other orchestration failure and
+  # writes no report and no status line, which also leaves the deterministic
+  # verify id free to retry once the configuration is corrected.
   if [ ! -e "$source_path" ] && [ ! -L "$source_path" ]; then
-    cleanup_build_worktree || exit 1
-    record_build_result "The expected artifact '$artifact' was missing."
-    exit 0
+    cleanup_build_worktree || true
+    echo "BLOCKED: the configured artifact '$artifact' is absent after a build that exited 0; no product verdict was recorded" >&2
+    echo "         confirm --artifact names what this build actually produces, then retry" >&2
+    exit 1
   fi
   resolved_source=$(resolve_existing_path "$source_path") || {
     cleanup_build_worktree || true

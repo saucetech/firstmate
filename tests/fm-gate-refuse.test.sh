@@ -361,6 +361,89 @@ test_teardown_refuses_and_admits() {
   pass "fm-teardown: refuses on marker and gate-worktree backstop; a normal teardown is unaffected"
 }
 
+# --- fm-verify --------------------------------------------------------------
+
+# fm-verify is the fourth fleet-lifecycle entrypoint. It binds a verification in
+# state/<id>.verify, adds a detached worktree to the shared project clone, and
+# runs an arbitrary --build-cmd, so the refusal has to land BEFORE all of that.
+# Discovering the gate context only when the final fm-spawn subprocess rejects
+# the launch would leave the binding, the build worktree, and the neutral
+# directory behind - and, because that path cannot confirm endpoint absence, it
+# would hold one of the two concurrency slots until a human reconciled it.
+
+# make_verify_case <slug> -> echoes a home holding one finished ship task whose
+# fm/<id> branch the task's project can resolve.
+make_verify_case() {
+  local slug=$1 home proj
+  home="$TMP/$slug/home"
+  proj="$TMP/$slug/proj"
+  mkdir -p "$home/state" "$home/data"
+  git init -q -b main "$proj"
+  git -C "$proj" commit -q --allow-empty -m init
+  git -C "$proj" checkout -q -b fm/ship-x1
+  git -C "$proj" commit -q --allow-empty -m "shipped change"
+  git -C "$proj" checkout -q main
+  fm_write_meta "$home/state/ship-x1.meta" \
+    "window=firstmate:fm-ship-x1" "endpoint_task_id=ship-x1" \
+    "project=$proj" "kind=ship" "mode=local-only"
+  printf 'done: implemented\n' > "$home/state/ship-x1.status"
+  printf '%s\n' "$home"
+}
+
+# run_verify <cwd> <home> [ASSIGN...] [-- SCRIPT_ARG...] -> combined output.
+# FM_VERIFY_SPAWN_OVERRIDE points at /bin/false so a launch that got this far
+# would be visible as a spawn failure rather than a real endpoint.
+run_verify() {
+  local cwd=$1 home=$2; shift 2
+  local assigns=() extra=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --) shift; extra=("$@"); break ;;
+      *) assigns+=("$1"); shift ;;
+    esac
+  done
+  ( cd "$cwd" && env -u NO_MISTAKES_GATE -u FM_GATE_REFUSE_BYPASS \
+      "FM_ROOT_OVERRIDE=$ROOT" "FM_HOME=$home" \
+      "FM_STATE_OVERRIDE=$home/state" "FM_DATA_OVERRIDE=$home/data" \
+      "FM_VERIFY_SPAWN_OVERRIDE=/bin/false" ${assigns[@]+"${assigns[@]}"} \
+      "$ROOT/bin/fm-verify.sh" ship-x1 --verify-id ship-x1-verify \
+      --promise 'A user gets what the change promised.' \
+      --build-cmd 'exit 0' --artifact build/app ${extra[@]+"${extra[@]}"} ) 2>&1
+}
+
+test_verify_refuses_and_admits() {
+  local home out rc
+
+  # env-marker refuse: nothing is bound and no build worktree is created.
+  home=$(make_verify_case verify-envmark)
+  out=$(run_verify "$NORMAL_CWD" "$home" NO_MISTAKES_GATE=1); rc=$?
+  expect_code 3 "$rc" "verify: NO_MISTAKES_GATE must refuse"
+  assert_contains "$out" "$ENV_MSG" "verify: env-marker refusal message"
+  assert_absent "$home/state/ship-x1-verify.verify" \
+    "verify: refused env-marker verification must not bind a verification"
+  assert_absent "$home/data/ship-x1-verify" \
+    "verify: refused env-marker verification must not scaffold a verifier brief"
+
+  # path-backstop refuse (marker UNSET).
+  home=$(make_verify_case verify-backstop)
+  out=$(run_verify "$GATE_WT" "$home"); rc=$?
+  expect_code 3 "$rc" "verify: gate-worktree cwd must refuse with the marker unset"
+  assert_contains "$out" "$PATH_MSG" "verify: path-backstop refusal message"
+  assert_absent "$home/state/ship-x1-verify.verify" \
+    "verify: refused backstop verification must not bind a verification"
+
+  # no-regression: a normal session runs the whole preflight (revision
+  # resolution, capacity, the spawn it would perform) and reports its plan.
+  home=$(make_verify_case verify-ok)
+  out=$(run_verify "$NORMAL_CWD" "$home" -- --dry-run); rc=$?
+  expect_code 0 "$rc" "verify: a normal session must still plan a verification"
+  assert_contains "$out" "verifier task: ship-x1-verify" \
+    "verify: normal preflight should report the verification it would run"
+  assert_not_contains "$out" "$ENV_MSG" "verify: normal preflight must not print the gate refusal"
+  assert_not_contains "$out" "$PATH_MSG" "verify: normal preflight must not print the backstop refusal"
+  pass "fm-verify: refuses on marker and gate-worktree backstop; a normal verification is unaffected"
+}
+
 test_helper_env_marker_refuses
 test_helper_empty_env_marker_refuses
 test_helper_path_backstop_refuses
@@ -368,3 +451,4 @@ test_helper_normal_is_noop
 test_spawn_refuses_and_admits
 test_send_refuses_and_admits
 test_teardown_refuses_and_admits
+test_verify_refuses_and_admits

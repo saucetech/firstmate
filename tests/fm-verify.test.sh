@@ -606,6 +606,125 @@ test_build_failure_is_a_result_without_a_spawn() {
   pass "fm-verify: build failure records not delivered without spawning"
 }
 
+# A build that exits 0 and leaves no artifact is indistinguishable from a
+# mistyped or stale --artifact, so fm-verify must not decide which it was. A
+# product verdict here would blame the product for the operator's typo and, with
+# the deterministic <ship-id>-verify-<rev> id, the durable report would then
+# refuse the very retry that fixes it.
+test_missing_artifact_after_a_clean_build_is_not_a_product_verdict() {
+  new_fixture artifact-missing
+  VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
+    --build-cmd 'exit 0' --artifact build/mistyped.txt 2>&1)
+  VERIFY_RC=$?
+  expect_code 1 "$VERIFY_RC" \
+    "an absent configured artifact is an orchestration failure, not a verification result"
+  assert_contains "$VERIFY_OUT" "BLOCKED" "the failure must be reported as blocked"
+  assert_contains "$VERIFY_OUT" "build/mistyped.txt" "the failure must name the configured artifact"
+  assert_not_contains "$VERIFY_OUT" "not delivered" \
+    "machinery must not speak for the product when the artifact path may simply be wrong"
+  assert_absent "$FIX_HOME/data/demo-ship-verify/report.md" \
+    "an absent artifact must not write a durable product report"
+  assert_absent "$FIX_HOME/state/demo-ship-verify.status" \
+    "an absent artifact must not write a product status line"
+  [ ! -s "$FIX_SPAWN_LOG" ] || fail "no verifier may spawn without a runnable artifact"
+  pass "fm-verify: an absent configured artifact reports blocked and records no verdict"
+}
+
+# install_gnu_stat_stub <dir>: a `stat` that answers the device/inode questions
+# the way GNU coreutils does. GNU's -f is --file-system and takes no format, so
+# a BSD-style `stat -f %i <path>` degrades into a failed stat of a file literally
+# named "%i"; -c is the format flag and works. That is exactly the shape of a
+# macOS box with coreutils ahead of /usr/bin/stat on PATH, which is where a
+# recorded identity and an expected identity produced by two different helpers
+# stop agreeing. Everything else is passed straight through, so unrelated mtime
+# reads in the fleet libraries keep working.
+install_gnu_stat_stub() {
+  local dir=$1
+  mkdir -p "$dir"
+  cat > "$dir/stat" <<'SH'
+#!/usr/bin/env bash
+set -u
+REAL_STAT=/usr/bin/stat
+host_field() {  # <field-format> <path>
+  "$REAL_STAT" -c "$1" "$2" 2>/dev/null || "$REAL_STAT" -f "$1" "$2" 2>/dev/null
+}
+case "${1:-}" in
+  -f)
+    case "${2:-}" in
+      %d|%i|'%d:%i')
+        printf "stat: cannot stat '%s': No such file or directory\n" "$2" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  -c)
+    case "${2:-}" in
+      %d|%i|'%d:%i')
+        [ -e "${3:-}" ] || {
+          printf "stat: cannot stat '%s': No such file or directory\n" "${3:-}" >&2
+          exit 1
+        }
+        device=$(host_field %d "$3")
+        inode=$(host_field %i "$3")
+        [ -n "$device" ] && [ -n "$inode" ] || exit 1
+        rendered=${2//%d/$device}
+        printf '%s\n' "${rendered//%i/$inode}"
+        exit 0
+        ;;
+    esac
+    ;;
+esac
+exec "$REAL_STAT" "$@"
+SH
+  chmod +x "$dir/stat"
+}
+
+# The neutral directory identity is written by fm-verify and re-checked by
+# fm-spawn at launch and fm-teardown at cleanup. If the producer and the
+# consumers reach it through different stat flavors, the two strings disagree on
+# any box where those flavors disagree, and every neutral launch and every
+# neutral cleanup refuses with a misleading "does not match its verifier
+# ownership binding". One shared helper is the only thing that makes the
+# comparison meaningful, so this drives the whole path through a stat that
+# behaves like GNU coreutils rather than trusting the host's flavors to agree.
+test_neutral_identity_comes_from_one_shared_helper() {
+  local stub_bin binding neutral expected out rc
+  new_fixture shared-identity
+  stub_bin="$TMP_ROOT/shared-identity/stubbin"
+  install_gnu_stat_stub "$stub_bin"
+
+  VERIFY_OUT=$(PATH="$stub_bin:$PATH" TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" \
+    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
+    --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
+  VERIFY_RC=$?
+  expect_code 0 "$VERIFY_RC" \
+    "a verification must bind its neutral directory through the shared identity helper (got: $VERIFY_OUT)"
+
+  binding="$FIX_HOME/state/demo-ship-verify.verify"
+  assert_present "$binding" "the verification binding must exist"
+  neutral=$(awk -F= '/^neutral_cleanup_path=/ { print substr($0, index($0, "=") + 1) }' "$binding")
+  [ -n "$neutral" ] || fail "the binding recorded no neutral directory path"
+
+  # This is what every consumer computes: fm-spawn records it as neutral_identity
+  # and fm-teardown compares it against the binding.
+  expected=$(PATH="$stub_bin:$PATH" bash -c \
+    'set -eu; . "$1/bin/fm-neutral-dir-lib.sh"; fm_neutral_filesystem_identity "$2"' \
+    fm-identity "$ROOT" "$neutral") \
+    || fail "the shared helper could not read the neutral directory identity"
+
+  out=$(PATH="$stub_bin:$PATH" bash -c \
+    'set -eu; . "$1/bin/fm-neutral-dir-lib.sh"; fm_neutral_directory_is_authorized "$2" "$3" "$4" "$5"' \
+    fm-identity "$ROOT" "$neutral" "$expected" "$binding" "$FIX_PROJ" 2>&1)
+  rc=$?
+  expect_code 0 "$rc" \
+    "the recorded and expected identities must agree, or neutral cleanup is dead on this box (got: $out)"
+
+  rm -rf "$neutral"
+  pass "fm-verify: the neutral identity is produced and consumed by one shared helper"
+}
+
 test_artifact_path_cannot_escape_through_a_symlinked_parent() {
   new_fixture artifact-parent-escape
   VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
@@ -1362,6 +1481,8 @@ test_existing_report_refuses_id_reuse
 test_partial_spawn_retains_reconciliation_artifacts
 test_spawn_handoff_persistence_failure_is_reported
 test_build_failure_is_a_result_without_a_spawn
+test_missing_artifact_after_a_clean_build_is_not_a_product_verdict
+test_neutral_identity_comes_from_one_shared_helper
 test_artifact_path_cannot_escape_through_a_symlinked_parent
 test_artifact_descendant_symlink_must_stay_neutral
 test_artifact_internal_symlink_is_preserved

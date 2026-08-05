@@ -1001,10 +1001,6 @@ real_path_or_raw() {  # <path>
   fi
 }
 
-filesystem_identity() {
-  fm_neutral_filesystem_identity "$1"
-}
-
 validate_neutral_launch_directory() {
   [ -d "$WT" ] || { echo "error: neutral launch directory is not a directory: $WT" >&2; return 1; }
   [ ! -L "$WT" ] || { echo "error: neutral launch directory must not be a symlink: $WT" >&2; return 1; }
@@ -1019,7 +1015,7 @@ validate_neutral_launch_directory() {
 }
 
 if [ "$NEUTRAL_SET" -eq 1 ]; then
-  NEUTRAL_IDENTITY=$(filesystem_identity "$WT") || {
+  NEUTRAL_IDENTITY=$(fm_neutral_filesystem_identity "$WT") || {
     echo "error: neutral launch directory filesystem identity cannot be recorded: $WT" >&2
     exit 1
   }

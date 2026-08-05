@@ -923,11 +923,30 @@ remove_neutral_directory() {
   fi
 }
 
+# Three-way endpoint probe, because "not confirmed absent" and "still there" are
+# different facts and only one of them is a diagnosis of the probe itself:
+#   0 - confirmed absent  (safe to retire the neutral directory)
+#   1 - confirmed present (the verifier endpoint is still live)
+#   2 - cannot determine  (the probe itself failed; nothing is proven)
+# Both non-zero outcomes still refuse removal - this narrows what counts as
+# unknown, it never widens what counts as safe to delete.
 neutral_endpoint_absence_confirmed() {
   local backend=$1 target=$2 session pane listed named stable workspaces panes workspace surface
   case "$backend" in
     tmux)
-      listed=$(tmux list-windows -a -F '#{session_name}:#{window_name} #{session_name}:#{window_id}' 2>/dev/null) || return 1
+      # A tmux server that is not running provably holds no window, so its
+      # absence IS confirmed absence - exactly how a missing zellij session and
+      # a missing cmux workspace are already treated below. Only a genuine
+      # inventory failure is undetermined, so the definitive no-server and
+      # unreachable-socket responses are matched by message the same way
+      # bin/backends/tmux.sh's agent-liveness probe matches them.
+      if ! listed=$(LC_ALL=C tmux list-windows -a -F '#{session_name}:#{window_name} #{session_name}:#{window_id}' 2>&1); then
+        case "$listed" in
+          *"no server running on "*|*"error connecting to "*" (No such file or directory)"|*"error connecting to "*" (Connection refused)")
+            return 0 ;;
+          *) return 2 ;;
+        esac
+      fi
       while IFS=' ' read -r named stable; do
         [ "$target" != "$named" ] || return 1
         [ "$target" != "$stable" ] || return 1
@@ -937,34 +956,50 @@ EOF
       return 0
       ;;
     zellij)
-      fm_backend_source zellij || return 1
-      fm_backend_zellij_parse_target "$target" || return 1
+      fm_backend_source zellij || return 2
+      fm_backend_zellij_parse_target "$target" || return 2
       session=$FM_BACKEND_ZELLIJ_SESSION
       pane=$FM_BACKEND_ZELLIJ_PANE
-      listed=$(zellij list-sessions --short --no-formatting 2>/dev/null) || return 1
+      listed=$(zellij list-sessions --short --no-formatting 2>/dev/null) || return 2
       printf '%s\n' "$listed" | grep -qxF "$session" || return 0
-      panes=$(fm_backend_zellij_cli "$session" action list-panes --json 2>/dev/null) || return 1
+      panes=$(fm_backend_zellij_cli "$session" action list-panes --json 2>/dev/null) || return 2
       printf '%s' "$panes" | jq -e --argjson pane "$pane" 'type == "array" and any(.[]?; .id == $pane and .is_plugin == false)' >/dev/null 2>&1 && return 1
-      printf '%s' "$panes" | jq -e 'type == "array"' >/dev/null 2>&1
+      printf '%s' "$panes" | jq -e 'type == "array"' >/dev/null 2>&1 || return 2
+      return 0
       ;;
     cmux)
-      fm_backend_source cmux || return 1
-      fm_backend_cmux_parse_target "$target" || return 1
+      fm_backend_source cmux || return 2
+      fm_backend_cmux_parse_target "$target" || return 2
       workspace=$FM_BACKEND_CMUX_WORKSPACE
       surface=$FM_BACKEND_CMUX_SURFACE
-      workspaces=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) || return 1
-      printf '%s' "$workspaces" | jq -e --arg workspace "$workspace" 'type == "object" and (.workspaces | type == "array")' >/dev/null 2>&1 || return 1
+      workspaces=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) || return 2
+      printf '%s' "$workspaces" | jq -e --arg workspace "$workspace" 'type == "object" and (.workspaces | type == "array")' >/dev/null 2>&1 || return 2
       printf '%s' "$workspaces" | jq -e --arg workspace "$workspace" 'any(.workspaces[]?; .id == $workspace)' >/dev/null 2>&1 || return 0
-      panes=$(fm_backend_cmux_cli list-panes --workspace "$workspace" --json --id-format uuids 2>/dev/null) || return 1
-      printf '%s' "$panes" | jq -e --arg surface "$surface" 'type == "object" and (.panes | type == "array")' >/dev/null 2>&1 || return 1
+      panes=$(fm_backend_cmux_cli list-panes --workspace "$workspace" --json --id-format uuids 2>/dev/null) || return 2
+      printf '%s' "$panes" | jq -e --arg surface "$surface" 'type == "object" and (.panes | type == "array")' >/dev/null 2>&1 || return 2
       printf '%s' "$panes" | jq -e --arg surface "$surface" 'any(.panes[]?; (.surface_ids // []) | index($surface))' >/dev/null 2>&1 && return 1
       return 0
       ;;
     herdr)
-      fm_backend_herdr_endpoint_confirmed_gone "$target"
+      # Only a structured not-found proves a herdr pane gone; every other answer
+      # leaves presence unknown rather than proving it.
+      fm_backend_herdr_endpoint_confirmed_gone "$target" || return 2
+      return 0
       ;;
   esac
-  return 1
+  return 2
+}
+
+# The refusal wording for a neutral endpoint that could not be proven gone.
+# <status> is neutral_endpoint_absence_confirmed's exit code.
+neutral_endpoint_refusal() {  # <status> <label> <id> <path>
+  local status=$1 label=$2 id=$3 path=$4 reason
+  if [ "$status" -eq 1 ]; then
+    reason="the endpoint is still present"
+  else
+    reason="endpoint absence is not confirmed"
+  fi
+  echo "error: $reason for $label $id at $path; retaining that directory and every durable identity record" >&2
 }
 
 registered_descendant_home_for_removal() {
@@ -1452,7 +1487,7 @@ preflight_firstmate_home_herdr_children() {  # <home>
 }
 
 cleanup_firstmate_home_children() {
-  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_busy_gen child_launch_mode child_neutral_identity child_neutral_target
+  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_busy_gen child_launch_mode child_neutral_identity child_neutral_target child_endpoint_status
   local -a inherited_protected
   shift
   inherited_protected=("$@")
@@ -1508,13 +1543,15 @@ cleanup_firstmate_home_children() {
         remove_firstmate_home "$child_home" "child firstmate home" "$child_id" || return $?
       fi
     elif [ "$child_launch_mode" = neutral ]; then
+      child_endpoint_status=0
       if [ "$child_backend" = zellij ]; then
-        if ! ( unset FM_ROOT_OVERRIDE; FM_HOME=$home FM_ROOT=$home neutral_endpoint_absence_confirmed "$child_backend" "$child_t" ); then
-          echo "error: endpoint absence is not confirmed for neutral child $child_id at $child_wt; retaining that directory and every durable identity record" >&2
-          return 1
-        fi
-      elif ! neutral_endpoint_absence_confirmed "$child_backend" "$child_t"; then
-        echo "error: endpoint absence is not confirmed for neutral child $child_id at $child_wt; retaining that directory and every durable identity record" >&2
+        ( unset FM_ROOT_OVERRIDE; FM_HOME=$home FM_ROOT=$home neutral_endpoint_absence_confirmed "$child_backend" "$child_t" ) \
+          || child_endpoint_status=$?
+      else
+        neutral_endpoint_absence_confirmed "$child_backend" "$child_t" || child_endpoint_status=$?
+      fi
+      if [ "$child_endpoint_status" -ne 0 ]; then
+        neutral_endpoint_refusal "$child_endpoint_status" "neutral child" "$child_id" "$child_wt"
         return 1
       fi
       child_neutral_identity=$(meta_value "$child_meta" neutral_identity)
@@ -1797,8 +1834,10 @@ if [ "$BACKEND" = herdr ]; then
   fi
 fi
 if [ "$LAUNCH_MODE" = neutral ]; then
-  if ! neutral_endpoint_absence_confirmed "$BACKEND" "$T"; then
-    echo "error: endpoint absence is not confirmed for neutral task $ID at $WT; retaining that directory and every durable identity record" >&2
+  NEUTRAL_ENDPOINT_STATUS=0
+  neutral_endpoint_absence_confirmed "$BACKEND" "$T" || NEUTRAL_ENDPOINT_STATUS=$?
+  if [ "$NEUTRAL_ENDPOINT_STATUS" -ne 0 ]; then
+    neutral_endpoint_refusal "$NEUTRAL_ENDPOINT_STATUS" "neutral task" "$ID" "$WT"
     exit 1
   fi
   NEUTRAL_TARGET=$(validate_neutral_removal_target \

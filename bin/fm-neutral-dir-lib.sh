@@ -16,8 +16,21 @@ fm_path_is_same_or_descendant_by_identity() {
   done
 }
 
+# The ONE device:inode helper. Every producer and every consumer of a neutral
+# directory identity must go through this function, because the two identities
+# that fm_neutral_directory_is_authorized compares (the one recorded at build
+# time and the one expected at launch/teardown time) are only comparable if a
+# single stat flavor produced both. Flavor is probed, never inferred from
+# `uname`: GNU coreutils stat is routinely ahead of /usr/bin/stat on a macOS
+# PATH, and there `-f` means --file-system, so a BSD-style `stat -f %i` reports
+# something entirely unrelated to an inode.
 fm_neutral_filesystem_identity() {
-  stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1" 2>/dev/null
+  local identity
+  identity=$(stat -c '%d:%i' "$1" 2>/dev/null) \
+    || identity=$(stat -f '%d:%i' "$1" 2>/dev/null) \
+    || return 1
+  case "$identity" in ''|:*|*:) return 1 ;; esac
+  printf '%s\n' "$identity"
 }
 
 fm_neutral_binding_value() {
