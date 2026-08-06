@@ -1596,7 +1596,9 @@ test_backend_that_cannot_launch_a_verifier_refuses_before_any_work() {
     --promise "$PROMISE" --build-cmd "touch '$marker'" --artifact "$BUILD_ARTIFACT" 2>&1)
   rc=$?
   expect_code 1 "$rc" "a backend that cannot launch a neutral verifier must refuse"
-  assert_contains "$out" "backend=orca" "the refusal must name the resolved backend"
+  assert_contains "$out" "backend 'orca'" "the refusal must name the resolved backend"
+  assert_contains "$out" "non-repository directory" \
+    "the refusal must name the neutral-launch capability the backend lacks"
   [ ! -e "$marker" ] || fail "an unusable backend ran the build before refusing"
   [ ! -s "$FIX_SPAWN_LOG" ] || fail "an unusable backend still reached the spawn"
   assert_absent "$FIX_HOME/state/demo-ship-verify.verify" \
@@ -1610,7 +1612,9 @@ test_backend_that_cannot_launch_a_verifier_refuses_before_any_work() {
     --promise "$PROMISE" --build-cmd "touch '$marker'" --artifact "$BUILD_ARTIFACT" 2>&1)
   rc=$?
   expect_code 1 "$rc" "an explicit --backend orca must refuse too"
-  assert_contains "$out" "backend=orca" "the explicit-flag refusal must name the backend"
+  assert_contains "$out" "backend 'orca'" "the explicit-flag refusal must name the backend"
+  assert_contains "$out" "non-repository directory" \
+    "the explicit-flag refusal must name the neutral-launch capability"
   [ ! -e "$marker" ] || fail "an explicit unusable backend ran the build before refusing"
   pass "fm-verify: a backend that cannot launch a verifier refuses before any expensive work"
 }

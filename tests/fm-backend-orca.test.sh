@@ -535,6 +535,60 @@ test_spawn_refuses_orca_secondmate_before_home_mutation() {
   pass "fm-spawn.sh --backend orca --secondmate: refuses before secondmate-home mutation"
 }
 
+test_spawn_refuses_orca_neutral_launch_before_mutation() {
+  local proj data state config neutral id out status
+  id="orcaneutralz2"
+  proj="$TMP_ROOT/neutral-refusal-project"
+  data="$TMP_ROOT/neutral-refusal-data"
+  state="$TMP_ROOT/neutral-refusal-state"
+  config="$TMP_ROOT/neutral-refusal-config"
+  neutral="$TMP_ROOT/neutral-refusal-dir"
+  fm_git_init_commit "$proj"
+  mkdir -p "$data/$id" "$state" "$config" "$neutral"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  out=$( FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend orca --scout --neutral-dir "$neutral" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "backend=orca with --neutral-dir should be refused"
+  assert_contains "$out" "backend 'orca'" \
+    "the neutral-launch refusal should name the backend it refused"
+  assert_contains "$out" "non-repository directory" \
+    "the neutral-launch refusal should name the capability orca lacks"
+  assert_absent "$state/$id.meta" "the neutral-launch refusal must not record metadata"
+  pass "fm-spawn.sh --backend orca --neutral-dir: refuses before any mutation"
+}
+
+# The refusal is conditional on a neutral directory actually being supplied.
+# Widening it to every orca spawn would break ordinary orca work, which is a far
+# larger regression than the one the refusal exists to prevent.
+test_spawn_allows_orca_without_a_neutral_directory() {
+  local proj data state config id out status
+  id="orcanoneutralz3"
+  proj="$TMP_ROOT/no-neutral-project"
+  data="$TMP_ROOT/no-neutral-data"
+  state="$TMP_ROOT/no-neutral-state"
+  config="$TMP_ROOT/no-neutral-config"
+  fm_git_init_commit "$proj"
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  orca_case no-neutral-spawn
+  printf '{"ok":true,"result":{"runtime":{"reachable":false,"state":"starting"}}}\n' > "$RESP/1.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" FM_ORCA_STATUS_RESPONSE=sequence \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "this fixture stops at the runtime check; a success means it never got there"
+  assert_not_contains "$out" "non-repository directory" \
+    "an orca spawn with no neutral directory must not meet the neutral-launch refusal"
+  assert_contains "$out" "requires a ready Orca runtime" \
+    "the spawn should have proceeded past backend selection to the runtime check"
+  pass "fm-spawn.sh --backend orca: the neutral-launch refusal stays scoped to --neutral-dir"
+}
+
 test_spawn_refuses_orca_when_runtime_not_ready() {
   local proj data state config id out status
   id="orcaruntimez6"
@@ -1304,6 +1358,8 @@ test_worktree_create_removes_worktree_when_path_missing
 test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails
 test_spawn_writes_orca_metadata_and_launches_harness
 test_spawn_refuses_orca_secondmate_before_home_mutation
+test_spawn_refuses_orca_neutral_launch_before_mutation
+test_spawn_allows_orca_without_a_neutral_directory
 test_spawn_refuses_orca_when_runtime_not_ready
 test_spawn_refuses_orca_nonisolated_worktree
 test_spawn_removes_orca_worktree_when_terminal_create_fails

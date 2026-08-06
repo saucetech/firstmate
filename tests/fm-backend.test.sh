@@ -535,6 +535,28 @@ test_backend_validate_spawn_accepts_orca() {
   pass "fm_backend_validate_spawn: all implemented lifecycle backends are spawn-supported"
 }
 
+# Which backends can host an agent in a supplied non-repository directory is a
+# backend capability fact, so it has to live beside FM_BACKEND_SPAWN rather than
+# be restated by each caller. Two independently worded copies drift, and a
+# preflight that disagrees with the spawn is worse than no preflight at all.
+test_backend_validate_neutral_launch_excludes_only_orca() {
+  local out
+  fm_backend_validate_neutral_launch tmux 2>/dev/null || fail "fm_backend_validate_neutral_launch should accept tmux"
+  fm_backend_validate_neutral_launch herdr 2>/dev/null || fail "fm_backend_validate_neutral_launch should accept herdr"
+  fm_backend_validate_neutral_launch zellij 2>/dev/null || fail "fm_backend_validate_neutral_launch should accept zellij"
+  fm_backend_validate_neutral_launch cmux 2>/dev/null || fail "fm_backend_validate_neutral_launch should accept cmux"
+  out=$(fm_backend_validate_neutral_launch orca 2>&1) && fail "fm_backend_validate_neutral_launch should refuse orca"
+  assert_contains "$out" "backend 'orca'" "the neutral-launch refusal must name the backend it refused"
+  assert_contains "$out" "non-repository directory" \
+    "the neutral-launch refusal must name the capability that is missing"
+  assert_contains "$out" "neutral-launch supported: $FM_BACKEND_NEUTRAL" \
+    "the neutral-launch refusal must name the supported list"
+  out=$(fm_backend_validate_neutral_launch bogus 2>&1) && fail "fm_backend_validate_neutral_launch should refuse unknown backends"
+  assert_contains "$out" "unknown backend 'bogus'" \
+    "fm_backend_validate_neutral_launch did not preserve unknown-backend validation"
+  pass "fm_backend_validate_neutral_launch: one owner decides which backends host a neutral launch"
+}
+
 test_meta_get_and_backend_of_meta() {
   local meta=$TMP_ROOT/meta-get.meta
   fm_write_meta "$meta" "window=firstmate:fm-x1" "harness=claude"
@@ -1148,6 +1170,7 @@ test_backend_name_explicit_beats_detection
 test_backend_validate_refuses_unknown
 test_backend_source_shell_portable
 test_backend_validate_spawn_accepts_orca
+test_backend_validate_neutral_launch_excludes_only_orca
 test_meta_get_and_backend_of_meta
 test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta

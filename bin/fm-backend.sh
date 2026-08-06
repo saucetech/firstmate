@@ -66,8 +66,14 @@ FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # cmux is EXPERIMENTAL and spawn-capable, session-provider-only like
 # herdr/zellij - verified against the real 0.64.17 binary (docs/cmux-backend.md).
 # codex-app remains deliberately absent; see docs/codex-app-backend.md.
+# FM_BACKEND_NEUTRAL is the subset that can launch an agent in a SUPPLIED
+# non-repository directory, which is how bin/fm-verify.sh keeps a verifier
+# outside every repo. orca is the one exclusion: it owns its own task worktree
+# and terminal rather than being a session provider, so it has nowhere to put an
+# agent that firstmate hands it a directory for.
 FM_BACKEND_KNOWN="tmux herdr zellij orca cmux"
 FM_BACKEND_SPAWN="tmux herdr zellij orca cmux"
+FM_BACKEND_NEUTRAL="tmux herdr zellij cmux"
 
 # fm_backend_list_contains: whitespace-delimited membership without relying on
 # shell word splitting. fm-backend.sh is normally sourced by bash scripts, but
@@ -291,6 +297,17 @@ fm_backend_validate_spawn() {  # <name>
   fm_backend_validate "$name" || return 1
   fm_backend_list_contains "$FM_BACKEND_SPAWN" "$name" && return 0
   echo "error: backend '$name' does not support task spawning yet (spawn-supported: $FM_BACKEND_SPAWN)" >&2
+  return 1
+}
+
+# Single owner of the neutral-launch refusal, so bin/fm-verify.sh's early
+# preflight and bin/fm-spawn.sh's own check can never drift into disagreeing
+# about which backends can host a verifier.
+fm_backend_validate_neutral_launch() {  # <name>
+  local name=$1
+  fm_backend_validate "$name" || return 1
+  fm_backend_list_contains "$FM_BACKEND_NEUTRAL" "$name" && return 0
+  echo "error: backend '$name' cannot launch an agent in a supplied non-repository directory (neutral-launch supported: $FM_BACKEND_NEUTRAL)" >&2
   return 1
 }
 

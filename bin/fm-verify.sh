@@ -168,11 +168,7 @@ else
   VERIFY_BACKEND=$(fm_backend_name)
 fi
 fm_backend_validate_spawn "$VERIFY_BACKEND" || exit 1
-if [ "$VERIFY_BACKEND" = orca ]; then
-  echo "error: backend=orca cannot launch a verifier in a supplied non-repository directory" >&2
-  echo "       run this verification on a backend that supports a neutral launch" >&2
-  exit 1
-fi
+fm_backend_validate_neutral_launch "$VERIFY_BACKEND" || exit 1
 
 SHIP_META="$STATE/$SHIP_ID.meta"
 [ -f "$SHIP_META" ] || { echo "error: no record of task '$SHIP_ID' at $SHIP_META" >&2; exit 1; }

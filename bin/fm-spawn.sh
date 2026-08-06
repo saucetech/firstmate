@@ -328,9 +328,8 @@ if [ "$BACKEND" = orca ] && [ "$KIND" = secondmate ]; then
   echo "error: backend=orca does not support --secondmate spawns yet" >&2
   exit 1
 fi
-if [ "$BACKEND" = orca ] && [ "$NEUTRAL_SET" -eq 1 ]; then
-  echo "error: backend=orca cannot launch a verifier in a supplied non-repository directory" >&2
-  exit 1
+if [ "$NEUTRAL_SET" -eq 1 ]; then
+  fm_backend_validate_neutral_launch "$BACKEND" || exit 1
 fi
 if [ "$BACKEND" = cmux ] && [ "$KIND" = secondmate ]; then
   echo "error: backend=cmux does not support --secondmate spawns yet" >&2
