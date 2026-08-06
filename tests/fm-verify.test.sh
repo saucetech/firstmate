@@ -1498,13 +1498,149 @@ test_dry_run_changes_nothing() {
 test_dispatch_flags_reach_the_spawn() {
   local args
   new_fixture passthrough
-  run_verify demo-ship --promise "$PROMISE" --harness claude --effort high --model opus-5
+  run_verify demo-ship --promise "$PROMISE" --harness claude --effort high --model opus-5 --backend tmux
   expect_code 0 "$VERIFY_RC" "a verification with dispatch flags must spawn (got: $VERIFY_OUT)"
   args=$(cat "$FIX_SPAWN_LOG")
   assert_contains "$args" "--harness claude" "the resolved harness must reach the spawn"
   assert_contains "$args" "--effort high" "the resolved effort must reach the spawn"
   assert_contains "$args" "--model opus-5" "the resolved model must reach the spawn"
+  assert_contains "$args" "--backend tmux" \
+    "a backend that survives the preflight must still reach the spawn unchanged"
   pass "fm-verify: dispatch profile flags pass through to the spawn unchanged"
+}
+
+# install_unsearchable_mktemp <fakebin> <template-glob>: a shim that hands back a
+# directory which is readable and writable but NOT searchable. `stat` still
+# answers, so the ownership records are published exactly as on the happy path,
+# while `cd` into it fails - the one shape that drives the canonicalization
+# guards without racing anything.
+install_unsearchable_mktemp() {
+  local fakebin=$1 glob=$2
+  mkdir -p "$fakebin"
+  cat > "$fakebin/mktemp" <<SH
+#!/usr/bin/env bash
+case "\$*" in
+  *$glob*)
+    mkdir -p "\$FM_VERIFY_TEST_TARGET"
+    chmod 600 "\$FM_VERIFY_TEST_TARGET"
+    printf '%s\n' "\$FM_VERIFY_TEST_TARGET"
+    exit 0
+    ;;
+esac
+exec "\$REAL_MKTEMP_VERIFY" "\$@"
+SH
+  chmod +x "$fakebin/mktemp"
+}
+
+# A refusal that empties the variable holding the path it is refusing about
+# destroys the only thing that made it recoverable: the EXIT trap's removal
+# becomes vacuous, KEEP_BINDING stays 0, and the rollback deletes the sidecar
+# while the mktemp'd directory stays on disk - a leaked directory whose
+# ownership record was just erased. The path must survive the failure.
+test_uncanonicalizable_neutral_directory_keeps_its_ownership_record() {
+  local neutral out rc
+  new_fixture uncanonicalizable-neutral
+  neutral="$FIX_TMP/unsearchable-neutral"
+  install_unsearchable_mktemp "$FIX_TMP/fakebin" 'fm-verify-artifacts.'
+  out=$(PATH="$FIX_TMP/fakebin:$PATH" TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" \
+    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" FM_VERIFY_TEST_TARGET="$neutral" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
+    --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
+  rc=$?
+  chmod 700 "$neutral" 2>/dev/null || true
+  expect_code 1 "$rc" "an uncanonicalizable neutral directory must refuse"
+  assert_contains "$out" "$neutral" \
+    "the refusal must name the exact directory it could not canonicalize"
+  if [ -e "$neutral" ] || [ -L "$neutral" ]; then
+    assert_grep "neutral_cleanup_path=$neutral" "$FIX_HOME/state/demo-ship-verify.verify" \
+      "a neutral directory left on disk must keep the binding that records who owns it"
+  fi
+  [ ! -s "$FIX_SPAWN_LOG" ] || fail "an uncanonicalizable neutral directory still spawned a verifier"
+  pass "fm-verify: an uncanonicalizable neutral directory never outlives its ownership record"
+}
+
+# The same shape one allocation earlier, where it is worse: cleanup_build_worktree
+# bails on an empty BUILD_CONTAINER, so the container leaked with no message at
+# all. Fixing one of two identical instances is how the next reader concludes
+# the pattern is fine.
+test_uncanonicalizable_build_container_is_not_leaked_silently() {
+  local container out rc
+  new_fixture uncanonicalizable-build-container
+  container="$FIX_TMP/unsearchable-container"
+  install_unsearchable_mktemp "$FIX_TMP/fakebin" 'fm-verify-build.'
+  out=$(PATH="$FIX_TMP/fakebin:$PATH" TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" \
+    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" FM_VERIFY_TEST_TARGET="$container" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
+    --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
+  rc=$?
+  chmod 700 "$container" 2>/dev/null || true
+  expect_code 1 "$rc" "an uncanonicalizable build container must refuse"
+  assert_contains "$out" "$container" \
+    "the refusal must name the exact container it could not canonicalize"
+  [ ! -e "$container" ] || fail "the build container was leaked instead of being cleaned up"
+  [ ! -s "$FIX_SPAWN_LOG" ] || fail "an uncanonicalizable build container still spawned a verifier"
+  pass "fm-verify: an uncanonicalizable build container is cleaned up, not silently leaked"
+}
+
+# bin/fm-spawn.sh refuses --neutral-dir under backend=orca, and every verifier
+# spawn supplies one. Meeting that refusal at the end - after a full detached
+# build, an artifact copy and a scaffolded brief - retains a neutral directory
+# for hand reconciliation every single time, for a mismatch that is knowable
+# before anything is written.
+test_backend_that_cannot_launch_a_verifier_refuses_before_any_work() {
+  local marker out rc
+  new_fixture orca-preflight
+  marker="$FIX_TMP/build-ran"
+  out=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
+    FM_BACKEND=orca "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify \
+    --promise "$PROMISE" --build-cmd "touch '$marker'" --artifact "$BUILD_ARTIFACT" 2>&1)
+  rc=$?
+  expect_code 1 "$rc" "a backend that cannot launch a neutral verifier must refuse"
+  assert_contains "$out" "backend=orca" "the refusal must name the resolved backend"
+  [ ! -e "$marker" ] || fail "an unusable backend ran the build before refusing"
+  [ ! -s "$FIX_SPAWN_LOG" ] || fail "an unusable backend still reached the spawn"
+  assert_absent "$FIX_HOME/state/demo-ship-verify.verify" \
+    "a backend refusal must leave no binding to reconcile"
+  assert_absent "$FIX_HOME/data/demo-ship-verify/brief.md" \
+    "a backend refusal must scaffold nothing"
+
+  # The flag form must refuse identically: the backend can arrive either way.
+  out=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --backend orca \
+    --promise "$PROMISE" --build-cmd "touch '$marker'" --artifact "$BUILD_ARTIFACT" 2>&1)
+  rc=$?
+  expect_code 1 "$rc" "an explicit --backend orca must refuse too"
+  assert_contains "$out" "backend=orca" "the explicit-flag refusal must name the backend"
+  [ ! -e "$marker" ] || fail "an explicit unusable backend ran the build before refusing"
+  pass "fm-verify: a backend that cannot launch a verifier refuses before any expensive work"
+}
+
+# "This verification WAITS for a slot" is true while work is in flight and false
+# when the slots are held by bindings a spawn stranded. The machinery must not
+# state something it knows to be false.
+test_capacity_refusal_names_stranded_bindings() {
+  local stranded out rc
+  new_fixture capacity-stranded
+  stranded="$FIX_HOME/state/stranded-verify.verify"
+  printf 'verifies=other\nendpoint_uncertain=1\n' > "$stranded"
+  out=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
+    FM_VERIFY_MAX_CONCURRENT=1 "$ROOT/bin/fm-verify.sh" demo-ship \
+    --verify-id demo-ship-verify --promise "$PROMISE" \
+    --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
+  rc=$?
+  expect_code 1 "$rc" "a stranded binding still holds its slot and still refuses"
+  assert_contains "$out" "at the limit of 1" "the refusal must still state the limit reached"
+  assert_contains "$out" "1 of those slot(s) are held by stranded bindings" \
+    "the refusal must name how many slots hold no work"
+  assert_contains "$out" "$stranded" \
+    "the refusal must name the exact binding path to reconcile"
+  assert_contains "$out" "endpoint_uncertain=1" \
+    "the refusal must name the field that keeps the slot held"
+  assert_contains "$out" "retained DELIBERATELY" \
+    "the refusal must say the binding is kept on purpose, not lost"
+  assert_not_contains "$out" "never skipped" \
+    "the refusal must not claim work is in flight when the slots are wedged"
+  pass "fm-verify: a capacity refusal names stranded bindings instead of implying live work"
 }
 
 test_unfinished_task_is_flagged_but_allowed() {
@@ -1569,4 +1705,8 @@ test_interrupted_neutral_publication_is_durable_and_blocks_retry
 test_retry_refuses_live_recorded_build_survivors
 test_dry_run_changes_nothing
 test_dispatch_flags_reach_the_spawn
+test_uncanonicalizable_neutral_directory_keeps_its_ownership_record
+test_uncanonicalizable_build_container_is_not_leaked_silently
+test_backend_that_cannot_launch_a_verifier_refuses_before_any_work
+test_capacity_refusal_names_stranded_bindings
 test_unfinished_task_is_flagged_but_allowed

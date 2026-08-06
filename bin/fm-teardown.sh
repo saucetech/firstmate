@@ -892,11 +892,25 @@ validate_removal_target() {
   printf '%s\n' "$abs_target"
 }
 
+# Returns 0 with the canonical path on stdout when the directory is present and
+# safe to remove, 2 when the path is already gone (nothing to remove, which is
+# the desired end state - the neutral directory lives under TMPDIR and is
+# routinely reaped), and 1 for every unsafe shape. Absent-means-skip must never
+# widen into mismatched-means-skip: a symlink, a non-directory, an identity
+# mismatch, a protected root or a path that became a git repository all still
+# refuse below.
 validate_neutral_removal_target() {
   local target=$1 expected_identity=$2 project=$3 binding=$4 abs_target
   shift 4
-  [ -n "$target" ] && [ -d "$target" ] && [ ! -L "$target" ] || {
-    echo "REFUSED: neutral verifier directory is not a removable ordinary directory: ${target:-<missing>}" >&2
+  [ -n "$target" ] || {
+    echo "REFUSED: neutral verifier directory is not a removable ordinary directory: <missing>" >&2
+    return 1
+  }
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    return 2
+  fi
+  [ -d "$target" ] && [ ! -L "$target" ] || {
+    echo "REFUSED: neutral verifier directory is not a removable ordinary directory: $target" >&2
     return 1
   }
   fm_neutral_directory_is_authorized \
@@ -1306,7 +1320,7 @@ preflight_firstmate_home_process_event_tree() {
 }
 
 validate_firstmate_home_children_removal() {
-  local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_launch_mode child_neutral_identity
+  local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_launch_mode child_neutral_identity child_neutral_status
   local -a inherited_protected
   shift
   inherited_protected=("$@")
@@ -1332,10 +1346,12 @@ validate_firstmate_home_children_removal() {
     elif [ "$child_launch_mode" = neutral ]; then
       child_proj=$(meta_value "$child_meta" project)
       child_neutral_identity=$(meta_value "$child_meta" neutral_identity)
+      child_neutral_status=0
       validate_neutral_removal_target \
         "$child_wt" "$child_neutral_identity" "$child_proj" \
         "$sub_state/$child_id.verify" "$home" "$home" "$home/projects" \
-        "${inherited_protected[@]}" >/dev/null || return 1
+        "${inherited_protected[@]}" >/dev/null || child_neutral_status=$?
+      [ "$child_neutral_status" -ne 1 ] || return 1
     elif [ "$child_backend" = orca ]; then
       child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
       if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
@@ -1487,7 +1503,7 @@ preflight_firstmate_home_herdr_children() {  # <home>
 }
 
 cleanup_firstmate_home_children() {
-  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_busy_gen child_launch_mode child_neutral_identity child_neutral_target child_endpoint_status
+  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_busy_gen child_launch_mode child_neutral_identity child_neutral_target child_neutral_status child_endpoint_status
   local -a inherited_protected
   shift
   inherited_protected=("$@")
@@ -1555,14 +1571,18 @@ cleanup_firstmate_home_children() {
         return 1
       fi
       child_neutral_identity=$(meta_value "$child_meta" neutral_identity)
+      child_neutral_status=0
       child_neutral_target=$(validate_neutral_removal_target \
         "$child_wt" "$child_neutral_identity" "$child_proj" \
         "$sub_state/$child_id.verify" "$home" "$home" "$home/projects" \
-        "${inherited_protected[@]}") || return 1
-      remove_neutral_directory \
-        "$child_neutral_target" "$child_neutral_identity" "$child_proj" \
-        "$sub_state/$child_id.verify" "$home" "$home" "$home/projects" \
-        "${inherited_protected[@]}" || return 1
+        "${inherited_protected[@]}") || child_neutral_status=$?
+      [ "$child_neutral_status" -ne 1 ] || return 1
+      if [ "$child_neutral_status" -eq 0 ]; then
+        remove_neutral_directory \
+          "$child_neutral_target" "$child_neutral_identity" "$child_proj" \
+          "$sub_state/$child_id.verify" "$home" "$home" "$home/projects" \
+          "${inherited_protected[@]}" || return 1
+      fi
     elif [ "$child_backend" = orca ]; then
       if [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
@@ -1840,12 +1860,16 @@ if [ "$LAUNCH_MODE" = neutral ]; then
     neutral_endpoint_refusal "$NEUTRAL_ENDPOINT_STATUS" "neutral task" "$ID" "$WT"
     exit 1
   fi
+  NEUTRAL_TARGET_STATUS=0
   NEUTRAL_TARGET=$(validate_neutral_removal_target \
     "$WT" "$NEUTRAL_IDENTITY" "$PROJ" "$STATE/$ID.verify" \
-    "$FM_ROOT" "$FM_HOME" "$PROJECTS") || exit 1
-  remove_neutral_directory \
-    "$NEUTRAL_TARGET" "$NEUTRAL_IDENTITY" "$PROJ" "$STATE/$ID.verify" \
-    "$FM_ROOT" "$FM_HOME" "$PROJECTS" || exit 1
+    "$FM_ROOT" "$FM_HOME" "$PROJECTS") || NEUTRAL_TARGET_STATUS=$?
+  [ "$NEUTRAL_TARGET_STATUS" -ne 1 ] || exit 1
+  if [ "$NEUTRAL_TARGET_STATUS" -eq 0 ]; then
+    remove_neutral_directory \
+      "$NEUTRAL_TARGET" "$NEUTRAL_IDENTITY" "$PROJ" "$STATE/$ID.verify" \
+      "$FM_ROOT" "$FM_HOME" "$PROJECTS" || exit 1
+  fi
 fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT

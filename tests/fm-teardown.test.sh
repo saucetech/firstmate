@@ -1649,6 +1649,71 @@ test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed() {
   pass "forced secondmate teardown retains Herdr child identity until exact pane disappearance"
 }
 
+# The neutral directory lives under TMPDIR, which macOS and systemd-tmpfiles
+# routinely reap, so "already gone" is the desired end state rather than an
+# unsafe one - exactly how every other worktree branch in this script treats an
+# absent path. Refusing it made a verifier task that sat for a few days
+# permanently untearable without hand-editing state.
+test_neutral_teardown_skips_a_reaped_directory() {
+  local case_dir neutral identity rc
+  case_dir=$(make_case neutral-reaped-directory)
+  neutral="$case_dir/neutral-verifier"
+  mkdir -p "$neutral"
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "window=firstmate:fm-task-x1" \
+    "endpoint_task_id=task-x1" \
+    "worktree=$neutral" \
+    "project=$case_dir/project" \
+    "kind=scout" \
+    "mode=local-only" \
+    "launch_mode=neutral" \
+    "neutral_identity=$identity"
+  write_neutral_binding "$case_dir/state/task-x1.verify" "$neutral" "$identity"
+  rmdir "$neutral"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" \
+    "reaped neutral directory: an already-absent path is nothing to remove: $(cat "$case_dir/stderr")"
+  [ ! -e "$case_dir/state/task-x1.meta" ] || fail "reaped neutral directory: task metadata was stranded"
+  pass "neutral teardown retires a verifier whose scratch directory was already reaped"
+}
+
+# The child path is the one that matters: returning 1 there aborts the ENTIRE
+# secondmate cleanup, so one reaped scratch directory blocked teardown of
+# unrelated sibling work.
+test_forced_secondmate_teardown_skips_a_reaped_neutral_child() {
+  local case_dir home neutral identity rc
+  case_dir=$(make_case secondmate-neutral-child-reaped)
+  write_meta "$case_dir" local-only secondmate
+  home="$case_dir/secondmate-home"
+  neutral="$case_dir/neutral-child"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects" "$neutral"
+  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
+  printf '%s\n' "home=$home" >> "$case_dir/state/task-x1.meta"
+  identity=$(stat -c '%d:%i' "$neutral" 2>/dev/null || stat -f '%d:%i' "$neutral")
+  fm_write_meta "$home/state/child-neutral.meta" \
+    "window=firstmate:fm-child-neutral" \
+    "endpoint_task_id=child-neutral" \
+    "worktree=$neutral" \
+    "project=$case_dir/project" \
+    "kind=scout" \
+    "mode=no-mistakes" \
+    "launch_mode=neutral" \
+    "neutral_identity=$identity"
+  write_neutral_binding "$home/state/child-neutral.verify" "$neutral" "$identity"
+  rmdir "$neutral"
+
+  rc=0
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" \
+    "reaped neutral child: one absent scratch directory must not abort the whole cleanup: $(cat "$case_dir/stderr")"
+  [ ! -e "$home/state/child-neutral.meta" ] || fail "reaped neutral child: child metadata was stranded"
+  [ ! -e "$case_dir/state/task-x1.meta" ] || fail "reaped neutral child: parent metadata was stranded"
+  pass "forced secondmate teardown retires a neutral child whose directory was already reaped"
+}
+
 test_neutral_teardown_refuses_replaced_directory_identity() {
   local case_dir neutral retained identity rc
   case_dir=$(make_case neutral-identity-mismatch)
@@ -2277,6 +2342,8 @@ test_herdr_flat_teardown_refuses_records_on_unparseable_presence
 test_herdr_flat_teardown_preflight_refuses_before_changes
 test_forced_secondmate_herdr_child_preflight_refuses_before_changes
 test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed
+test_neutral_teardown_skips_a_reaped_directory
+test_forced_secondmate_teardown_skips_a_reaped_neutral_child
 test_neutral_teardown_refuses_replaced_directory_identity
 test_neutral_teardown_retains_records_when_removal_fails
 test_neutral_teardown_retains_records_when_endpoint_absence_is_unconfirmed

@@ -18,6 +18,12 @@
 #   --dry-run              run preflight and print the plan without writing
 #   -h, --help             print this header
 #
+# The runtime backend is resolved here the same way bin/fm-spawn.sh resolves it
+# - the explicit --backend, else FM_BACKEND, else config/backend, else detection
+# - and a backend that cannot launch a verifier in a supplied non-repository
+# directory refuses before the build worktree exists, rather than at the spawn
+# with a neutral directory left to reconcile by hand.
+#
 # FM_VERIFY_BUILD_TIMEOUT bounds the build in seconds and defaults to 1800.
 # FM_VERIFY_MAX_CONCURRENT defaults to 2. Reaching capacity delays verification;
 # it never exempts one. FM_VERIFY_SPAWN_OVERRIDE replaces fm-spawn.sh for tests.
@@ -84,6 +90,8 @@ BUILD_CMD_SET=0
 ARTIFACTS=()
 REV_ARG=
 VERIFY_ID=
+BACKEND_ARG=
+BACKEND_SET=0
 DRY_RUN=0
 PASSTHROUGH=()
 POS=()
@@ -99,7 +107,8 @@ for a in "$@"; do
       artifact) ARTIFACTS+=("$a") ;;
       rev) REV_ARG=$a ;;
       verify-id) VERIFY_ID=$a ;;
-      harness|model|effort|backend) PASSTHROUGH+=("--$want_value" "$a") ;;
+      backend) BACKEND_ARG=$a; BACKEND_SET=1; PASSTHROUGH+=("--backend" "$a") ;;
+      harness|model|effort) PASSTHROUGH+=("--$want_value" "$a") ;;
     esac
     want_value=
     continue
@@ -112,7 +121,8 @@ for a in "$@"; do
     --artifact=*) ARTIFACTS+=("${a#--artifact=}") ;;
     --rev=*) REV_ARG=${a#--rev=} ;;
     --verify-id=*) VERIFY_ID=${a#--verify-id=} ;;
-    --harness=*|--model=*|--effort=*|--backend=*) PASSTHROUGH+=("$a") ;;
+    --backend=*) BACKEND_ARG=${a#--backend=}; BACKEND_SET=1; PASSTHROUGH+=("$a") ;;
+    --harness=*|--model=*|--effort=*) PASSTHROUGH+=("$a") ;;
     --dry-run) DRY_RUN=1 ;;
     --*) echo "error: unknown option '$a'" >&2; exit 2 ;;
     *) POS+=("$a") ;;
@@ -145,6 +155,24 @@ for artifact in "${ARTIFACTS[@]}"; do
     ''|/*|..|../*|*/..|*/../*) echo "error: --artifact must be a safe path relative to the build worktree: $artifact" >&2; exit 2 ;;
   esac
 done
+
+# Resolve the runtime backend the same way bin/fm-spawn.sh does, and refuse
+# here whatever it would refuse at spawn. Every verifier spawn supplies
+# --neutral-dir, so an orca fleet fails at the very last step - after the
+# detached build has run, artifacts were copied and the binding already carries
+# endpoint_uncertain=1 - leaving a retained neutral directory to reconcile by
+# hand for a mismatch that is detectable before anything is written.
+if [ "$BACKEND_SET" -eq 1 ]; then
+  VERIFY_BACKEND=$BACKEND_ARG
+else
+  VERIFY_BACKEND=$(fm_backend_name)
+fi
+fm_backend_validate_spawn "$VERIFY_BACKEND" || exit 1
+if [ "$VERIFY_BACKEND" = orca ]; then
+  echo "error: backend=orca cannot launch a verifier in a supplied non-repository directory" >&2
+  echo "       run this verification on a backend that supports a neutral launch" >&2
+  exit 1
+fi
 
 SHIP_META="$STATE/$SHIP_ID.meta"
 [ -f "$SHIP_META" ] || { echo "error: no record of task '$SHIP_ID' at $SHIP_META" >&2; exit 1; }
@@ -299,9 +327,48 @@ live_verifications() {
   printf '%s\n' "$count"
 }
 
+# The sidecars inside live_verifications' count that no longer have any work
+# behind them: a spawn left the binding with an endpoint whose outcome could
+# not be determined, so it is retained on purpose and nothing retires it. They
+# hold a slot exactly like a running verification does, and the refusal below
+# must not describe them as work in flight.
+stranded_verification_paths() {
+  local sidecar id endpoint_uncertain
+  for sidecar in "$STATE"/*.verify; do
+    [ -f "$sidecar" ] || continue
+    id=$(basename "$sidecar" .verify)
+    [ ! -f "$STATE/$id.meta" ] || continue
+    endpoint_uncertain=$(fm_meta_get "$sidecar" endpoint_uncertain)
+    [ "$endpoint_uncertain" = 1 ] || continue
+    printf '%s\n' "$sidecar"
+  done
+}
+
 capacity_refusal() {
+  local stranded stranded_count=0 path
+  stranded=$(stranded_verification_paths)
   echo "error: $1 verification(s) already running, at the limit of $MAX_CONCURRENT" >&2
-  echo "       this verification WAITS for a slot; it is never skipped - the merge waits with it" >&2
+  if [ -n "$stranded" ]; then
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      stranded_count=$((stranded_count + 1))
+    done <<EOF
+$stranded
+EOF
+    echo "       $stranded_count of those slot(s) are held by stranded bindings, not by work in flight:" >&2
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      echo "         $path (endpoint_uncertain=1)" >&2
+    done <<EOF
+$stranded
+EOF
+    echo "       each of those spawns left an endpoint whose outcome could not be determined, so the" >&2
+    echo "       binding is retained DELIBERATELY for reconciliation and nothing expires it" >&2
+    echo "       there is no command that retires one: reconcile each endpoint by hand, and remove its" >&2
+    echo "       state/<id>.verify only once you have confirmed no verifier endpoint remains" >&2
+  else
+    echo "       this verification WAITS for a slot; it is never skipped - the merge waits with it" >&2
+  fi
 }
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -1222,10 +1289,11 @@ BUILD_CONTAINER=$(mktemp -d "${TMPDIR:-/tmp}/fm-verify-build.XXXXXX") || {
   echo "BLOCKED: could not allocate a detached build-worktree container" >&2
   exit 1
 }
-BUILD_CONTAINER=$(CDPATH='' cd -- "$BUILD_CONTAINER" && pwd -P) || {
-  echo "BLOCKED: could not canonicalize the detached build-worktree container" >&2
+BUILD_CONTAINER_REAL=$(CDPATH='' cd -- "$BUILD_CONTAINER" && pwd -P) || {
+  echo "BLOCKED: could not canonicalize the detached build-worktree container at $BUILD_CONTAINER" >&2
   exit 1
 }
+BUILD_CONTAINER=$BUILD_CONTAINER_REAL
 BUILD_DIR="$BUILD_CONTAINER/worktree"
 BUILD_DIR_REAL="$BUILD_DIR"
 SIGNAL_CRITICAL=1
@@ -1252,10 +1320,11 @@ if ! printf 'neutral_cleanup_identity=%s\n' "$NEUTRAL_IDENTITY" >> "$VERIFY_SIDE
   exit 1
 fi
 finish_signal_critical_section
-NEUTRAL_DIR=$(CDPATH='' cd -- "$NEUTRAL_DIR" && pwd -P) || {
-  echo "BLOCKED: could not canonicalize the neutral artifact directory" >&2
+NEUTRAL_DIR_REAL=$(CDPATH='' cd -- "$NEUTRAL_DIR" && pwd -P) || {
+  echo "BLOCKED: could not canonicalize the neutral artifact directory at $NEUTRAL_DIR" >&2
   exit 1
 }
+NEUTRAL_DIR=$NEUTRAL_DIR_REAL
 mkdir -p "$NEUTRAL_DIR/artifacts" "$NEUTRAL_DIR/scratch" || {
   echo "BLOCKED: could not prepare the neutral artifact directory at $NEUTRAL_DIR" >&2
   exit 1
