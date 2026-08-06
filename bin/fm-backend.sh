@@ -66,8 +66,14 @@ FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # cmux is EXPERIMENTAL and spawn-capable, session-provider-only like
 # herdr/zellij - verified against the real 0.64.17 binary (docs/cmux-backend.md).
 # codex-app remains deliberately absent; see docs/codex-app-backend.md.
+# FM_BACKEND_NEUTRAL is the subset that can launch an agent in a SUPPLIED
+# non-repository directory, which is how bin/fm-verify.sh keeps a verifier
+# outside every repo. orca is the one exclusion: it owns its own task worktree
+# and terminal rather than being a session provider, so it has nowhere to put an
+# agent that firstmate hands it a directory for.
 FM_BACKEND_KNOWN="tmux herdr zellij orca cmux"
 FM_BACKEND_SPAWN="tmux herdr zellij orca cmux"
+FM_BACKEND_NEUTRAL="tmux herdr zellij cmux"
 
 # fm_backend_list_contains: whitespace-delimited membership without relying on
 # shell word splitting. fm-backend.sh is normally sourced by bash scripts, but
@@ -291,6 +297,17 @@ fm_backend_validate_spawn() {  # <name>
   fm_backend_validate "$name" || return 1
   fm_backend_list_contains "$FM_BACKEND_SPAWN" "$name" && return 0
   echo "error: backend '$name' does not support task spawning yet (spawn-supported: $FM_BACKEND_SPAWN)" >&2
+  return 1
+}
+
+# Single owner of the neutral-launch refusal, so bin/fm-verify.sh's early
+# preflight and bin/fm-spawn.sh's own check can never drift into disagreeing
+# about which backends can host a verifier.
+fm_backend_validate_neutral_launch() {  # <name>
+  local name=$1
+  fm_backend_validate "$name" || return 1
+  fm_backend_list_contains "$FM_BACKEND_NEUTRAL" "$name" && return 0
+  echo "error: backend '$name' cannot launch an agent in a supplied non-repository directory (neutral-launch supported: $FM_BACKEND_NEUTRAL)" >&2
   return 1
 }
 
@@ -592,12 +609,25 @@ fm_backend_expected_label_of_selector() {  # <raw-target> <state-dir>
 # Each adapter is an independently linted canonical root. The /dev/null source
 # boundaries keep runtime dispatch from importing all five adapter ASTs into
 # every dispatcher consumer while preserving the runtime source operations.
+# `.` is a POSIX special builtin, so a source of a path that does not exist
+# terminates a non-interactive shell outright - `|| return 1` never runs and
+# neither does the caller's designed refusal. bash 5 tolerates it and bash 3.2,
+# which is what stock macOS ships as /bin/bash, does not. Callers report an
+# unavailable adapter as a visible, retryable refusal, so the readability of the
+# adapter has to be proven BEFORE it is sourced or that refusal is unreachable
+# on macOS and the operator sees only a raw sourcing error. Do not fold this
+# back into the `.` line; the guard is the whole point.
+fm_backend_adapter_readable() {  # <name>
+  [ -r "$FM_BACKEND_LIB_DIR/backends/$1.sh" ]
+}
+
 fm_backend_source() {  # <name>
   local name=$1
   fm_backend_validate "$name" || return 1
   case "$name" in
     tmux)
       if [ -z "${_FM_BACKEND_TMUX_SOURCED:-}" ]; then
+        fm_backend_adapter_readable "tmux" || return 1
         # shellcheck source=/dev/null
         . "$FM_BACKEND_LIB_DIR/backends/tmux.sh" || return 1
         _FM_BACKEND_TMUX_SOURCED=1
@@ -605,6 +635,7 @@ fm_backend_source() {  # <name>
       ;;
     herdr)
       if [ -z "${_FM_BACKEND_HERDR_SOURCED:-}" ]; then
+        fm_backend_adapter_readable "herdr" || return 1
         # shellcheck source=/dev/null
         . "$FM_BACKEND_LIB_DIR/backends/herdr.sh" || return 1
         _FM_BACKEND_HERDR_SOURCED=1
@@ -612,6 +643,7 @@ fm_backend_source() {  # <name>
       ;;
     zellij)
       if [ -z "${_FM_BACKEND_ZELLIJ_SOURCED:-}" ]; then
+        fm_backend_adapter_readable "zellij" || return 1
         # shellcheck source=/dev/null
         . "$FM_BACKEND_LIB_DIR/backends/zellij.sh" || return 1
         _FM_BACKEND_ZELLIJ_SOURCED=1
@@ -619,6 +651,7 @@ fm_backend_source() {  # <name>
       ;;
     orca)
       if [ -z "${_FM_BACKEND_ORCA_SOURCED:-}" ]; then
+        fm_backend_adapter_readable "orca" || return 1
         # shellcheck source=/dev/null
         . "$FM_BACKEND_LIB_DIR/backends/orca.sh" || return 1
         _FM_BACKEND_ORCA_SOURCED=1
@@ -626,6 +659,7 @@ fm_backend_source() {  # <name>
       ;;
     cmux)
       if [ -z "${_FM_BACKEND_CMUX_SOURCED:-}" ]; then
+        fm_backend_adapter_readable "cmux" || return 1
         # shellcheck source=/dev/null
         . "$FM_BACKEND_LIB_DIR/backends/cmux.sh" || return 1
         _FM_BACKEND_CMUX_SOURCED=1

@@ -83,17 +83,18 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   projects.md        thin fleet navigation registry recording each project's standing delivery posture; firstmate-private, parsed for mechanical sync and seeding by fm-project-mode.sh (section 6)
   secondmates.md      secondmate routing table; firstmate-private, maintained by fm-home-seed.sh (section 6)
   <id>/brief.md      per-task crewmate brief, or per-secondmate charter brief when kind=secondmate
-  <id>/report.md     scout task deliverable, written by the crewmate; survives teardown
+  <id>/report.md     scout or verifier deliverable, written by the crewmate; survives teardown
 projects/            cloned repos; gitignored; read-only except under hard rule 1's concrete captain-approved project operation exception
 state/               volatile runtime signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth
   <id>.turn-ended    touched by turn-end hooks
   <id>.grok-turnend-token   firstmate-owned grok hook registry token for the task; removed by teardown
   <id>.kimi-turnend-token   firstmate-owned Kimi hook registry token for the task; removed by teardown
-  <id>.meta          written by fm-spawn: window=, endpoint_task_id=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=; kind=secondmate also records home= and projects=; a non-default runtime backend records further backend-specific fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, records one canonical pr= and the forge's pr_head= when available (GitHub pull requests and GitLab merge requests; docs/gitlab-merge-watch.md); fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14)
+  <id>.meta          written by fm-spawn: window=, endpoint_task_id=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=; kind=secondmate also records home= and projects=; a neutral verifier launch records launch_mode=neutral and neutral_identity= instead of a project worktree (section 7); a non-default runtime backend records further backend-specific fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, records one canonical pr= and the forge's pr_head= when available (GitHub pull requests and GitLab merge requests; docs/gitlab-merge-watch.md); fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14)
   <id>.herdr-presentation  quarantinable attempt and restart-binding journal for Herdr's optional visual projection; never task or endpoint authority; see docs/herdr-backend.md "Optional presentation spaces"
   <id>.check.sh      authenticated slow poll; the watcher dispatches validated PR data and the byte-identified X shim through trusted repository scripts, runs registered custom checks from hash-validated private snapshots, and rejects every other state check without execution
   <id>.check-trust   private content binding created by fm-check-register.sh for an intentional custom check
+  <id>.verify        private durable verifier binding and retained-cleanup ownership; binds a verifier task to the ship task, revision, and promise whose merge its verdict gates; bin/fm-verify.sh owns the exact fields and lifecycle (section 7)
   <id>.pr-poll       private validated data sidecar for the byte-static PR merge poll
   <id>.pr-poll-registration  private transactional provenance record binding the task, canonical metadata identity, sidecar, and static poll publication
   <id>.pr-poll-retirement  private identity-bound crash-recovery receipt for one exact validated merged result; removed after its poll artifacts retire
@@ -299,8 +300,8 @@ With `yolo` on, firstmate decides routine gates only within the captain's origin
 Standing `yolo` authority never approves an ask-user Fix that would materially expand that product or engineering contract; destructive, irreversible, and security-sensitive choices remain stronger captain boundaries.
 Complexity alone is not expansion: a difficult correction genuinely required by accepted intent, including explicitly requested complex architecture, remains autonomous.
 Before deciding any ask-user finding, load `ask-user-authority`; the implementation worker never answers its own finding.
-Never merge a red PR.
-Without a current explicit captain instruction that states the concrete merge, that default stands, and standing `yolo` cannot authorize a red merge; section 1 owns when such an instruction overrides a Firstmate-written standing rule within its exact scope.
+Never merge a red PR, and never merge a change the Verify stage below covers until it holds a `delivered` verdict.
+Without a current explicit captain instruction that states the concrete merge, those defaults stand, and standing `yolo` cannot authorize a red or unverified merge; section 1 owns when such an instruction overrides a Firstmate-written standing rule within its exact scope.
 Use `bin/fm-pr-merge.sh` for every task PR merge so merge metadata is recorded, and use `bin/fm-merge-local.sh` for approved local-only landing; never call a lower-level merge command around their guards.
 After an autonomous merge, give the captain a one-line full-URL or local-main outcome.
 
@@ -327,6 +328,24 @@ Judge validation by the current-code-matched run step through `bin/fm-crew-state
 Running, fixing, or CI states remain working; parked approval or fix-review states require the worker to follow the active gate help; passed or checks-passed is done; failed or cancelled is failed.
 A worker hand-editing, committing, aborting, or restarting during an active validation run duplicates pipeline ownership outside the supersession sequence above; steer it back to the gate response flow.
 The worker reports the PR when CI first becomes green rather than waiting for merge monitoring to finish.
+
+### Verify
+
+After implementation and any applicable validation finish, a covered ship change is checked before merge by an independent verifier that uses the product as its user would; `bin/fm-verify.sh` and its help own promise authoring, revision resolution, binding, and capacity mechanics.
+
+Verify every ship change before it merges unless the whole change is confined to this closed list: refactors with no behavior change, test-only changes, documentation, build or CI tooling, and comments.
+Anything outside that list is verified, and a change that mixes both is verified.
+Name the list entry that covers a skipped verification; being busy or judging it unlikely to matter are not entries on it.
+
+Independence is the entire value, so the only contextual input is the user-facing promise, written as observable claims in the user's own words; the other input is the built runnable artifact.
+Never hand a verifier the diff, the implementing brief, report, or status log, or the PR, and never let the worker that built a change verify it.
+The verifier runs against a built artifact outside every repository, so the source tree and its implementation context cannot reach the verifier.
+
+Read the verdict from the verifier's report and relay its findings as outcomes, especially anything it flags as looking finished while failing the user.
+`delivered` clears this stage only while the recorded `rev` in `state/<verify-id>.verify` exactly matches the head being merged; `partially delivered` and `not delivered` both hold the merge until the captain decides or the gap is fixed and re-verified.
+Re-verify whenever the head moves after verification.
+A claimed delivery carrying no per-claim evidence is not a verdict, so re-run it rather than accepting it.
+When capacity delays a verification the merge waits with it; a verification is deferred, never dropped.
 
 ### PR ready, landing, and teardown
 

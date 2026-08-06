@@ -29,6 +29,10 @@
 # declared scratch and the report at data/<task-id>/report.md is the work
 # product. Teardown proceeds only once the report exists and the shared
 # unresolved-decision completion gate verifies its captain-held inventory.
+# Verifier scouts use launch_mode=neutral instead of a worktree. Teardown removes
+# their scratch directory only after the recorded endpoint is confirmed absent and
+# the directory still matches its durable verifier binding and filesystem identity;
+# otherwise it preserves the directory and every ownership record for reconciliation.
 # Before destructive cleanup, teardown validates task check artifacts and any
 # matching quarantine entries as ordinary single-link files on the state
 # device. It refuses and preserves task state when that proof fails; otherwise
@@ -94,6 +98,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 SECONDMATE_REG="$DATA/secondmates.md"
 SUB_HOME_MARKER=".fm-secondmate-home"
 # shellcheck source=bin/fm-tasks-axi-lib.sh
@@ -110,6 +115,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-public-followup-lib.sh"
 # shellcheck source=bin/fm-secondmate-registry-lib.sh
 . "$SCRIPT_DIR/fm-secondmate-registry-lib.sh"
+# shellcheck source=bin/fm-neutral-dir-lib.sh
+. "$SCRIPT_DIR/fm-neutral-dir-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
   echo "error: invalid teardown request" >&2
   exit 2
@@ -148,6 +155,8 @@ ORCA_PATH_MATCH_VERIFIED=0
 
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
+LAUNCH_MODE=$(fm_meta_get "$META" launch_mode)
+NEUTRAL_IDENTITY=$(fm_meta_get "$META" neutral_identity)
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
 PUBLIC_FOLLOWUP_HOME=$FM_HOME
@@ -883,6 +892,130 @@ validate_removal_target() {
   printf '%s\n' "$abs_target"
 }
 
+# Returns 0 with the canonical path on stdout when the directory is present and
+# safe to remove, 2 when the path is already gone (nothing to remove, which is
+# the desired end state - the neutral directory lives under TMPDIR and is
+# routinely reaped), and 1 for every unsafe shape. Absent-means-skip must never
+# widen into mismatched-means-skip: a symlink, a non-directory, an identity
+# mismatch, a protected root or a path that became a git repository all still
+# refuse below.
+validate_neutral_removal_target() {
+  local target=$1 expected_identity=$2 project=$3 binding=$4 abs_target
+  shift 4
+  [ -n "$target" ] || {
+    echo "REFUSED: neutral verifier directory is not a removable ordinary directory: <missing>" >&2
+    return 1
+  }
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    return 2
+  fi
+  [ -d "$target" ] && [ ! -L "$target" ] || {
+    echo "REFUSED: neutral verifier directory is not a removable ordinary directory: $target" >&2
+    return 1
+  }
+  fm_neutral_directory_is_authorized \
+    "$target" "$expected_identity" "$binding" \
+    "$project" "$@" || return 1
+  abs_target=$(removal_target_abs_path "$target") || return 1
+  if git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+     || git -C "$target" rev-parse --is-inside-git-dir >/dev/null 2>&1; then
+    echo "REFUSED: neutral verifier directory became a git repository: $target" >&2
+    return 1
+  fi
+  printf '%s\n' "$abs_target"
+}
+
+remove_neutral_directory() {
+  local target=$1 expected_identity=$2 project=$3 binding=$4
+  shift 4
+  fm_neutral_directory_is_authorized \
+    "$target" "$expected_identity" "$binding" \
+    "$project" "$@" || return 1
+  if ! rm -rf -- "$target" || [ -e "$target" ] || [ -L "$target" ]; then
+    echo "error: neutral verifier directory removal could not be confirmed for $target; retaining its durable metadata and binding for reconciliation" >&2
+    return 1
+  fi
+}
+
+# Three-way endpoint probe, because "not confirmed absent" and "still there" are
+# different facts and only one of them is a diagnosis of the probe itself:
+#   0 - confirmed absent  (safe to retire the neutral directory)
+#   1 - confirmed present (the verifier endpoint is still live)
+#   2 - cannot determine  (the probe itself failed; nothing is proven)
+# Both non-zero outcomes still refuse removal - this narrows what counts as
+# unknown, it never widens what counts as safe to delete.
+neutral_endpoint_absence_confirmed() {
+  local backend=$1 target=$2 session pane listed named stable workspaces panes workspace surface
+  case "$backend" in
+    tmux)
+      # A tmux server that is not running provably holds no window, so its
+      # absence IS confirmed absence - exactly how a missing zellij session and
+      # a missing cmux workspace are already treated below. Only a genuine
+      # inventory failure is undetermined, so the definitive no-server and
+      # unreachable-socket responses are matched by message the same way
+      # bin/backends/tmux.sh's agent-liveness probe matches them.
+      if ! listed=$(LC_ALL=C tmux list-windows -a -F '#{session_name}:#{window_name} #{session_name}:#{window_id}' 2>&1); then
+        case "$listed" in
+          *"no server running on "*|*"error connecting to "*" (No such file or directory)"|*"error connecting to "*" (Connection refused)")
+            return 0 ;;
+          *) return 2 ;;
+        esac
+      fi
+      while IFS=' ' read -r named stable; do
+        [ "$target" != "$named" ] || return 1
+        [ "$target" != "$stable" ] || return 1
+      done <<EOF
+$listed
+EOF
+      return 0
+      ;;
+    zellij)
+      fm_backend_source zellij || return 2
+      fm_backend_zellij_parse_target "$target" || return 2
+      session=$FM_BACKEND_ZELLIJ_SESSION
+      pane=$FM_BACKEND_ZELLIJ_PANE
+      listed=$(zellij list-sessions --short --no-formatting 2>/dev/null) || return 2
+      printf '%s\n' "$listed" | grep -qxF "$session" || return 0
+      panes=$(fm_backend_zellij_cli "$session" action list-panes --json 2>/dev/null) || return 2
+      printf '%s' "$panes" | jq -e --argjson pane "$pane" 'type == "array" and any(.[]?; .id == $pane and .is_plugin == false)' >/dev/null 2>&1 && return 1
+      printf '%s' "$panes" | jq -e 'type == "array"' >/dev/null 2>&1 || return 2
+      return 0
+      ;;
+    cmux)
+      fm_backend_source cmux || return 2
+      fm_backend_cmux_parse_target "$target" || return 2
+      workspace=$FM_BACKEND_CMUX_WORKSPACE
+      surface=$FM_BACKEND_CMUX_SURFACE
+      workspaces=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) || return 2
+      printf '%s' "$workspaces" | jq -e --arg workspace "$workspace" 'type == "object" and (.workspaces | type == "array")' >/dev/null 2>&1 || return 2
+      printf '%s' "$workspaces" | jq -e --arg workspace "$workspace" 'any(.workspaces[]?; .id == $workspace)' >/dev/null 2>&1 || return 0
+      panes=$(fm_backend_cmux_cli list-panes --workspace "$workspace" --json --id-format uuids 2>/dev/null) || return 2
+      printf '%s' "$panes" | jq -e --arg surface "$surface" 'type == "object" and (.panes | type == "array")' >/dev/null 2>&1 || return 2
+      printf '%s' "$panes" | jq -e --arg surface "$surface" 'any(.panes[]?; (.surface_ids // []) | index($surface))' >/dev/null 2>&1 && return 1
+      return 0
+      ;;
+    herdr)
+      # Only a structured not-found proves a herdr pane gone; every other answer
+      # leaves presence unknown rather than proving it.
+      fm_backend_herdr_endpoint_confirmed_gone "$target" || return 2
+      return 0
+      ;;
+  esac
+  return 2
+}
+
+# The refusal wording for a neutral endpoint that could not be proven gone.
+# <status> is neutral_endpoint_absence_confirmed's exit code.
+neutral_endpoint_refusal() {  # <status> <label> <id> <path>
+  local status=$1 label=$2 id=$3 path=$4 reason
+  if [ "$status" -eq 1 ]; then
+    reason="the endpoint is still present"
+  else
+    reason="endpoint absence is not confirmed"
+  fi
+  echo "error: $reason for $label $id at $path; retaining that directory and every durable identity record" >&2
+}
+
 registered_descendant_home_for_removal() {
   local reg=$1 target=$2 line id registered_home registered_abs
   [ -f "$reg" ] || return 1
@@ -1187,7 +1320,10 @@ preflight_firstmate_home_process_event_tree() {
 }
 
 validate_firstmate_home_children_removal() {
-  local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id
+  local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_launch_mode child_neutral_identity child_neutral_status
+  local -a inherited_protected
+  shift
+  inherited_protected=("$@")
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -1199,11 +1335,23 @@ validate_firstmate_home_children_removal() {
     child_kind=$(meta_value "$child_meta" kind)
     [ -n "$child_kind" ] || child_kind=ship
     child_backend=$(fm_backend_of_meta "$child_meta")
+    child_launch_mode=$(meta_value "$child_meta" launch_mode)
     if [ "$child_kind" = secondmate ]; then
       child_home=$(meta_value "$child_meta" home)
       [ -n "$child_home" ] || child_home=$child_wt
       validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" >/dev/null || return 1
-      validate_firstmate_home_children_removal "$child_home" || return 1
+      validate_firstmate_home_children_removal \
+        "$child_home" "$home" "$home" "$home/projects" \
+        "${inherited_protected[@]}" || return 1
+    elif [ "$child_launch_mode" = neutral ]; then
+      child_proj=$(meta_value "$child_meta" project)
+      child_neutral_identity=$(meta_value "$child_meta" neutral_identity)
+      child_neutral_status=0
+      validate_neutral_removal_target \
+        "$child_wt" "$child_neutral_identity" "$child_proj" \
+        "$sub_state/$child_id.verify" "$home" "$home" "$home/projects" \
+        "${inherited_protected[@]}" >/dev/null || child_neutral_status=$?
+      [ "$child_neutral_status" -ne 1 ] || return 1
     elif [ "$child_backend" = orca ]; then
       child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
       if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
@@ -1355,7 +1503,10 @@ preflight_firstmate_home_herdr_children() {  # <home>
 }
 
 cleanup_firstmate_home_children() {
-  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_busy_gen
+  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc child_busy_gen child_launch_mode child_neutral_identity child_neutral_target child_neutral_status child_endpoint_status
+  local -a inherited_protected
+  shift
+  inherited_protected=("$@")
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
   for child_meta in "$sub_state"/*.meta; do
@@ -1366,12 +1517,13 @@ cleanup_firstmate_home_children() {
     child_kind=$(meta_value "$child_meta" kind)
     [ -n "$child_kind" ] || child_kind=ship
     child_backend=$(fm_backend_of_meta "$child_meta")
+    child_launch_mode=$(meta_value "$child_meta" launch_mode)
     if [ "$child_backend" = orca ]; then
       child_t=$(meta_value "$child_meta" terminal)
     else
       child_t=$(fm_backend_target_of_meta "$child_meta")
     fi
-    if [ "$child_backend" = orca ] && [ "$child_kind" != secondmate ]; then
+    if [ "$child_backend" = orca ] && [ "$child_kind" != secondmate ] && [ "$child_launch_mode" != neutral ]; then
       child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
       if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
@@ -1401,8 +1553,35 @@ cleanup_firstmate_home_children() {
       child_home=$(meta_value "$child_meta" home)
       [ -n "$child_home" ] || child_home=$child_wt
       if [ -n "$child_home" ] && [ -d "$child_home" ]; then
-        cleanup_firstmate_home_children "$child_home" || return $?
+        cleanup_firstmate_home_children \
+          "$child_home" "$home" "$home" "$home/projects" \
+          "${inherited_protected[@]}" || return $?
         remove_firstmate_home "$child_home" "child firstmate home" "$child_id" || return $?
+      fi
+    elif [ "$child_launch_mode" = neutral ]; then
+      child_endpoint_status=0
+      if [ "$child_backend" = zellij ]; then
+        ( unset FM_ROOT_OVERRIDE; FM_HOME=$home FM_ROOT=$home neutral_endpoint_absence_confirmed "$child_backend" "$child_t" ) \
+          || child_endpoint_status=$?
+      else
+        neutral_endpoint_absence_confirmed "$child_backend" "$child_t" || child_endpoint_status=$?
+      fi
+      if [ "$child_endpoint_status" -ne 0 ]; then
+        neutral_endpoint_refusal "$child_endpoint_status" "neutral child" "$child_id" "$child_wt"
+        return 1
+      fi
+      child_neutral_identity=$(meta_value "$child_meta" neutral_identity)
+      child_neutral_status=0
+      child_neutral_target=$(validate_neutral_removal_target \
+        "$child_wt" "$child_neutral_identity" "$child_proj" \
+        "$sub_state/$child_id.verify" "$home" "$home" "$home/projects" \
+        "${inherited_protected[@]}") || child_neutral_status=$?
+      [ "$child_neutral_status" -ne 1 ] || return 1
+      if [ "$child_neutral_status" -eq 0 ]; then
+        remove_neutral_directory \
+          "$child_neutral_target" "$child_neutral_identity" "$child_proj" \
+          "$sub_state/$child_id.verify" "$home" "$home" "$home/projects" \
+          "${inherited_protected[@]}" || return 1
       fi
     elif [ "$child_backend" = orca ]; then
       if [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
@@ -1458,7 +1637,8 @@ if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
-    validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
+    validate_firstmate_home_children_removal \
+      "$HOME_PATH" "$FM_ROOT" "$FM_HOME" "$PROJECTS" || exit 1
     if [ "$BACKEND" = herdr ]; then
       teardown_herdr_preflight_target "$T" "$ID" || exit 1
     fi
@@ -1483,7 +1663,8 @@ if [ "$KIND" = secondmate ]; then
 fi
 
 if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
-  cleanup_firstmate_home_children "$HOME_PATH" || exit $?
+  cleanup_firstmate_home_children \
+    "$HOME_PATH" "$FM_ROOT" "$FM_HOME" "$PROJECTS" || exit $?
 fi
 
 if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
@@ -1533,7 +1714,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] &&
   ORCA_PATH_MATCH_VERIFIED=1
 fi
 
-if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
+if [ -d "$WT" ] && [ "$FORCE" != "--force" ] && [ "$LAUNCH_MODE" != neutral ]; then
   if validate_worktree_teardown_safety; then
     :
   else
@@ -1582,7 +1763,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   fi
   [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
   fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
-elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
+elif [ -d "$WT" ] && [ "$KIND" != secondmate ] && [ "$LAUNCH_MODE" != neutral ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
   if [ "$branch" != "HEAD" ]; then
     if git -C "$WT" checkout --detach -q 2>/dev/null; then
@@ -1670,6 +1851,24 @@ if [ "$BACKEND" = herdr ]; then
   if ! fm_backend_herdr_endpoint_confirmed_gone "$T"; then
     echo "error: herdr pane $T for $ID is not confirmed gone after its close was refused, skipped, or failed; retaining every durable task record - rerun teardown once the close can run under the session lock" >&2
     exit 1
+  fi
+fi
+if [ "$LAUNCH_MODE" = neutral ]; then
+  NEUTRAL_ENDPOINT_STATUS=0
+  neutral_endpoint_absence_confirmed "$BACKEND" "$T" || NEUTRAL_ENDPOINT_STATUS=$?
+  if [ "$NEUTRAL_ENDPOINT_STATUS" -ne 0 ]; then
+    neutral_endpoint_refusal "$NEUTRAL_ENDPOINT_STATUS" "neutral task" "$ID" "$WT"
+    exit 1
+  fi
+  NEUTRAL_TARGET_STATUS=0
+  NEUTRAL_TARGET=$(validate_neutral_removal_target \
+    "$WT" "$NEUTRAL_IDENTITY" "$PROJ" "$STATE/$ID.verify" \
+    "$FM_ROOT" "$FM_HOME" "$PROJECTS") || NEUTRAL_TARGET_STATUS=$?
+  [ "$NEUTRAL_TARGET_STATUS" -ne 1 ] || exit 1
+  if [ "$NEUTRAL_TARGET_STATUS" -eq 0 ]; then
+    remove_neutral_directory \
+      "$NEUTRAL_TARGET" "$NEUTRAL_IDENTITY" "$PROJ" "$STATE/$ID.verify" \
+      "$FM_ROOT" "$FM_HOME" "$PROJECTS" || exit 1
   fi
 fi
 if [ "$KIND" = secondmate ]; then

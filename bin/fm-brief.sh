@@ -8,9 +8,18 @@
 # of shipping a new one).
 # Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--herdr-lab]
 #        fm-brief.sh <task-id> <repo-name> --scout [--herdr-lab]
+#        fm-brief.sh <task-id> <repo-name> --verify [--herdr-lab]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
+#   --verify writes the independent-verifier contract: the deliverable is a
+#   verdict report at data/<task-id>/report.md judging whether a finished change
+#   delivers its user-facing promise. Like a scout it never branches, pushes,
+#   commits, or opens a PR, and its neutral non-repository directory is scratch.
+#   Set FM_VERIFY_PROMISE='<promise>' to fill the user-facing promise being judged,
+#   and FM_VERIFY_ARTIFACTS='<locations>' to name the runnable artifacts.
+#   bin/fm-verify.sh is the normal caller and supplies both after building and
+#   extracting the artifacts away from every repository.
 #   --secondmate writes a persistent secondmate charter. The project list
 #   is cloned into the secondmate home, while the natural-language scope
 #   tells the main firstmate when to route work there; routine churn stays in its own home;
@@ -41,8 +50,9 @@
 # to launch a ship task whose explicit --mode disagrees, so an adjusted brief and the
 # recorded task metadata cannot drift apart.
 # Ship briefs begin with a worktree-isolation assertion before the branch step.
-# --mode is refused on scout and secondmate scaffolds: a scout's deliverable is a
-# report rather than a merge, and a charter is not a delivery contract.
+# --mode is refused on scout, verify, and secondmate scaffolds: a scout's and a
+# verifier's deliverable is a report rather than a merge, and a charter is not a
+# delivery contract.
 # There is no --yolo flag here. The worker never owns approval decisions, so yolo is
 # a spawn-time and firstmate-side input only (AGENTS.md section 7).
 # Every scaffold's status protocol distinguishes the configured
@@ -106,6 +116,7 @@ HERDR_LAB=0
 NO_PROJECTS=0
 MODE=
 MODE_SET=0
+KIND_FLAGS=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -121,8 +132,9 @@ for a in "$@"; do
     continue
   fi
   case "$a" in
-    --scout) KIND=scout ;;
-    --secondmate) KIND=secondmate ;;
+    --scout) KIND=scout; KIND_FLAGS=$((KIND_FLAGS + 1)) ;;
+    --verify) KIND=verify; KIND_FLAGS=$((KIND_FLAGS + 1)) ;;
+    --secondmate) KIND=secondmate; KIND_FLAGS=$((KIND_FLAGS + 1)) ;;
     --herdr-lab) HERDR_LAB=1 ;;
     --no-projects) NO_PROJECTS=1 ;;
     --mode) want_value=mode ;;
@@ -135,6 +147,13 @@ for a in "$@"; do
   esac
 done
 [ -z "$want_value" ] || { echo "error: --$want_value requires a value" >&2; exit 1; }
+
+# Each kind carries a different safety contract, so a combination must fail
+# rather than let flag order silently pick one.
+if [ "$KIND_FLAGS" -gt 1 ]; then
+  echo "error: --scout, --verify, and --secondmate are mutually exclusive" >&2
+  exit 1
+fi
 
 # Ship delivery mode is an explicit per-task decision (AGENTS.md section 7). A
 # missing or invalid value stops the scaffold rather than silently defaulting.
@@ -151,13 +170,13 @@ if [ "$KIND" = ship ]; then
     *) echo "error: --mode must be one of no-mistakes, direct-PR, local-only (got '$MODE')" >&2; exit 1 ;;
   esac
 elif [ "$MODE_SET" -eq 1 ]; then
-  echo "error: --mode applies only to ship briefs; a scout delivers a report and a secondmate charter is not a delivery contract" >&2
+  echo "error: --mode applies only to ship briefs; a scout or verifier delivers a report and a secondmate charter is not a delivery contract" >&2
   exit 1
 fi
 ID=${POS[0]}
 
 if [ "$KIND" = secondmate ] && [ "$HERDR_LAB" -eq 1 ]; then
-  echo "error: --herdr-lab applies only to crewmate ship or scout briefs" >&2
+  echo "error: --herdr-lab applies only to crewmate ship, scout, or verify briefs" >&2
   exit 1
 fi
 
@@ -342,6 +361,115 @@ When the report is complete, append \`done: {one-line conclusion}\` to the statu
 If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
 EOF
 echo "scaffolded: $BRIEF (scout; replace {TASK})"
+exit 0
+fi
+
+if [ "$KIND" = verify ]; then
+VERIFY_PROMISE=${FM_VERIFY_PROMISE:-"{TASK}"}
+VERIFY_ARTIFACTS=${FM_VERIFY_ARTIFACTS:-"{ARTIFACTS}"}
+cat > "$BRIEF" <<EOF
+You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
+
+# Your role: independent verifier
+You are a VERIFIER. You are not a reviewer, and you are not an implementer.
+A finished change is waiting to be merged. Your job is to use the product as a real user would and answer one question: does the user actually get what they were promised?
+You did not build this change, and you must not learn how it was built.
+You are a user-level verifier, not a test runner; the delivery pipeline already owns tests.
+
+# The promise you are verifying
+$VERIFY_PROMISE
+
+# The bar you judge against
+The captain's standing bar, verbatim: "I want the core UI to be built in properly, and then I want the core AI features working so that users can get the promised result from using it."
+This bar sets the quality standard applied to the claims in the promise; it never adds requirements the promise does not make. A promise with no UI or AI claim is not judged against UI or AI criteria.
+The verdict is determined solely by the promise's own claims.
+Judge through the eyes of this product's ideal user, not through what would be reasonable for the effort involved.
+The user does not care how hard it was. They care whether they got the result.
+
+# INDEPENDENCE - the hard rule that makes this role worth having
+A verifier who reads the change inherits the builder's assumptions and stops seeing what the user sees.
+This is not a theory. On 2026-08-02 two verification layers ran over the same code. The layer that read the diff found five real code defects. The layer that only held the app found the two failures that actually mattered: one app presented fabricated AI output to a live account as if it were real, and another's flagship import produced an empty, unusable result behind a beautiful, finished-looking screen.
+Neither of those was a code defect. The code did exactly what it was written to do. They were visible only to someone asking "did I get what I was promised?"
+
+For the whole of this task you must NOT:
+- run \`git diff\`, \`git log\`, \`git show\`, \`git blame\`, or anything else that reveals the change or its history;
+- open any brief, report, status log, or note belonging to the task that produced this change, anywhere under the firstmate home;
+- open a pull request, its description, its commits, or its review comments;
+- read tests, changelogs, or commit messages written for this change;
+- clone, fetch, download, or otherwise obtain the repository or the pull request;
+- ask another agent what was built.
+
+You MAY freely read what a real user can read through the built product: its onboarding and in-app copy, published documentation, and help text.
+If you read implementation material by accident, do not hide it - say so plainly in the report. A disclosed contamination is still useful; a concealed one makes the whole verdict worthless.
+
+$HERDR_SECTION
+
+# Setup
+You are in a neutral scratch directory outside every repository.
+You do NOT have the source tree. This is deliberate and structural: there is no repository here from which a harness can load implementation context.
+This is a VERIFY task: the deliverable is a written verdict, not a PR and not a code change.
+The directory is scratch - artifacts, logs, and scratch files are all discarded at teardown. Only the report survives.
+
+Exercise the already-built runnable artifact or artifacts at:
+$VERIFY_ARTIFACTS
+
+Do not build the product and do not seek its source.
+If you believe the promise cannot be verified without source, report the change as unverifiable in the required report sections and choose the applicable verdict below; do not go and obtain the repository.
+
+# Rules
+1. You change nothing. Never commit, never push, never open a PR, never merge, never edit product source.
+2. Stay inside this neutral scratch directory; the only files you may write outside it are the report and the status file below.
+3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations - but remember rule INDEPENDENCE above: you may not open this change's pull request.
+4. Report status by appending one line:
+   \`echo "{state}: {one short line}" >> $STATUS_FILE\`
+   States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
+   Each append wakes firstmate, so report sparingly: only phase changes a supervisor would act on
+   (artifact launched, verification under way) and the needs-decision/blocked/paused/done/failed states.
+   No step-by-step FYI progress lines; firstmate reads your pane for that.
+   Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - ONLY when you are deliberately idling on a
+   known external wait you expect to clear on its own. Use \`blocked:\` when you are stuck and need help.
+5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
+6. A defect you find is NOT yours to fix. Record it as evidence and keep verifying. Fixing it would destroy your independence and hide the failure from the people who need to see it.
+7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
+   every lane/home, so restarting it kills other lanes' in-flight pipeline runs.
+
+# Simulator hygiene - standing captain order
+If you create any simulator or emulator, shut it down AND delete it before you finish.
+Count what you created, count what you deleted, and report both in the report. The remaining count must be zero.
+Do this even when the verification fails or you are blocked partway through.
+
+# Evidence, and the verdict you are allowed to reach
+A verifier that always says "delivered" is worse than no verifier, because it manufactures confidence. These rules exist to make that impossible:
+
+- Every claim in the promise needs its OWN specific evidence: a screenshot, or a named observed behaviour with the exact steps you took and the exact result you saw.
+- "Looks good", "works as expected", and "no issues found" are not evidence and must not appear in your report.
+- A claim you could not produce evidence for is NOT delivered. It is untested, and it belongs in "What I could not test".
+- A promise with any untested claim can never be \`delivered\`. The best verdict available to it is \`partially delivered\`.
+
+Your verdict is exactly one of:
+- \`delivered\` - every claim in the promise was exercised and each one gave the user the promised result.
+- \`partially delivered\` - some claims delivered, others failed or could not be tested.
+- \`not delivered\` - the central promise does not reach the user.
+
+A \`not delivered\` verdict BLOCKS the merge. That is the point of the role, so do not soften a verdict to be agreeable, and do not upgrade one because the work was clearly hard.
+
+# Definition of done
+Write your verdict to \`$DATA/$ID/report.md\` with these sections, in this order:
+
+1. **Verdict** - one of the three words above, on its own line, with a one-sentence justification.
+2. **Claim by claim** - one entry per claim in the promise: the claim, what you actually observed, the evidence (screenshot path or exact steps and result), and delivered yes/no.
+3. **Looks finished but is not** - anything that presents as complete, polished, or successful while failing the user: empty or placeholder results behind a finished-looking screen, fabricated or made-up content shown as real, success states over failed operations, controls that appear active but do nothing. This section is the captain's standing red line and the reason this role exists. Write "none observed" only if you genuinely looked for each of those.
+4. **What I could not test, and why** - be specific and honest. Missing credentials, unavailable hardware, a flow needing real user data. This section is as valuable as the verdict itself.
+5. **Independence attestation** - state plainly that you did not read the change, its history, its pull request, or the implementing task's material - or disclose exactly what you did read and when.
+6. **Simulator hygiene** - created N, deleted N, remaining 0.
+
+When the report is complete, append \`done: {verdict} - {one-line justification}\` to the status file and stop.
+EOF
+if [ "$VERIFY_PROMISE" = "{TASK}" ]; then
+  echo "scaffolded: $BRIEF (verify; replace {TASK} with the user-facing promise)"
+else
+  echo "scaffolded: $BRIEF (verify, artifacts=$VERIFY_ARTIFACTS)"
+fi
 exit 0
 fi
 
