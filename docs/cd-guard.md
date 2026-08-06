@@ -26,7 +26,7 @@ It is a silent no-op (exit 0, no output) everywhere else, so it never interferes
 
 `bin/fm-cd-pretool-check.sh` owns its checkout detection; the turn-end guard's marker-aware scope is a separate contract (`docs/turnend-guard.md`).
 A plain, non-worktree checkout has `git rev-parse --git-dir` equal to `git rev-parse --git-common-dir`.
-A crewmate or scout task worktree - the shape `bin/fm-spawn.sh` always hands out - is a linked git worktree where the two differ, so the guard is inert there.
+A crewmate or scout task worktree - the shape `bin/fm-spawn.sh` hands out for every worktree-backed task - is a linked git worktree where the two differ, so the guard is inert there.
 The checkout must also carry `AGENTS.md` and `bin/`, and any failure to confirm the primary is treated as inert, never as a block.
 
 The cd-guard does not inspect `.fm-secondmate-home`.
