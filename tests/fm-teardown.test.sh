@@ -1525,13 +1525,8 @@ SH
     PATH="$case_dir/fakebin:$PATH" \
     "$teardown_bin" task-x1 --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
   [ "$rc" -ne 0 ] || fail "herdr-preflight-$mode: teardown continued without its required preflight"
-  if [ "$mode" = missing-adapter ]; then
-    assert_grep 'backends/herdr.sh: No such file or directory' "$case_dir/stderr" \
-      "herdr-preflight-$mode: the missing adapter was not reported visibly"
-  else
-    assert_grep "nothing was changed" "$case_dir/stderr" \
-      "herdr-preflight-$mode: the retryable pre-return refusal was not explained visibly: $(cat "$case_dir/stderr")"
-  fi
+  assert_grep "nothing was changed" "$case_dir/stderr" \
+    "herdr-preflight-$mode: the retryable pre-return refusal was not explained visibly: $(cat "$case_dir/stderr")"
   [ -d "$case_dir/wt" ] || fail "herdr-preflight-$mode: refusal removed the isolated copy"
   [ "$(git -C "$case_dir/wt" rev-parse --abbrev-ref HEAD 2>/dev/null)" = "fm/task-x1" ] \
     || fail "herdr-preflight-$mode: refusal dropped the task branch"

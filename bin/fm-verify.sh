@@ -1252,7 +1252,10 @@ if ! printf 'neutral_cleanup_identity=%s\n' "$NEUTRAL_IDENTITY" >> "$VERIFY_SIDE
   exit 1
 fi
 finish_signal_critical_section
-NEUTRAL_DIR=$(CDPATH='' cd -- "$NEUTRAL_DIR" && pwd -P)
+NEUTRAL_DIR=$(CDPATH='' cd -- "$NEUTRAL_DIR" && pwd -P) || {
+  echo "BLOCKED: could not canonicalize the neutral artifact directory" >&2
+  exit 1
+}
 mkdir -p "$NEUTRAL_DIR/artifacts" "$NEUTRAL_DIR/scratch" || {
   echo "BLOCKED: could not prepare the neutral artifact directory at $NEUTRAL_DIR" >&2
   exit 1
