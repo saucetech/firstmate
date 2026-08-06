@@ -631,23 +631,46 @@ test_missing_artifact_after_a_clean_build_is_not_a_product_verdict() {
   pass "fm-verify: an absent configured artifact reports blocked and records no verdict"
 }
 
-# install_gnu_stat_stub <dir>: a `stat` that answers the device/inode questions
-# the way GNU coreutils does. GNU's -f is --file-system and takes no format, so
-# a BSD-style `stat -f %i <path>` degrades into a failed stat of a file literally
-# named "%i"; -c is the format flag and works. That is exactly the shape of a
-# macOS box with coreutils ahead of /usr/bin/stat on PATH, which is where a
-# recorded identity and an expected identity produced by two different helpers
-# stop agreeing. Everything else is passed straight through, so unrelated mtime
-# reads in the fleet libraries keep working.
-install_gnu_stat_stub() {
+# install_divergent_stat_host <dir>: PATH shims reproducing the one host shape
+# where an OS-branched identity reader silently stops working - a macOS box with
+# GNU coreutils ahead of /usr/bin/stat. Two facts must hold at once, which is why
+# both shims exist: `uname` says Darwin, so a reader that branches on the OS
+# picks the BSD spelling, while the `stat` it actually reaches is GNU, where -f
+# is --file-system and a BSD-style `stat -f %i <path>` degrades into a failed
+# stat of a file literally named "%i". -c is the format flag and works.
+#
+# Stubbing the stat flavor ALONE proves nothing on Linux, which is the only OS
+# that runs this suite in CI: there `uname` already reports Linux, so every
+# reader takes the -c branch and a branched helper agrees with the shared one
+# whether or not the bug is present. The uname shim is what makes these tests
+# assert anything where they actually run.
+#
+# Scope note: BSD-format reads this fixture is not about - mode, link count,
+# mtime - are answered rather than left to fail, so these tests can only redden
+# for the identity question. A real such host exposes those readers too; that is
+# a pre-existing property of fm-pr-lib and fm-lock-lib, untouched here.
+install_divergent_stat_host() {
   local dir=$1
   mkdir -p "$dir"
+  cat > "$dir/uname" <<'SH'
+#!/usr/bin/env bash
+# Bare `uname` is the only form the fleet libraries use to pick a stat spelling.
+[ "$#" -eq 0 ] && { printf 'Darwin\n'; exit 0; }
+for real in /usr/bin/uname /bin/uname; do
+  [ -x "$real" ] && exec "$real" "$@"
+done
+exit 127
+SH
+  chmod +x "$dir/uname"
   cat > "$dir/stat" <<'SH'
 #!/usr/bin/env bash
 set -u
 REAL_STAT=/usr/bin/stat
-host_field() {  # <field-format> <path>
+host_field() {  # <field-format> <path>: %d and %i spell the same in both flavors
   "$REAL_STAT" -c "$1" "$2" 2>/dev/null || "$REAL_STAT" -f "$1" "$2" 2>/dev/null
+}
+either() {  # <gnu-format> <bsd-format> <path>
+  "$REAL_STAT" -c "$1" "$3" 2>/dev/null || "$REAL_STAT" -f "$2" "$3" 2>/dev/null
 }
 case "${1:-}" in
   -f)
@@ -656,6 +679,9 @@ case "${1:-}" in
         printf "stat: cannot stat '%s': No such file or directory\n" "$2" >&2
         exit 1
         ;;
+      %m)  [ -e "${3:-}" ] && either %Y %m "$3" && exit 0; exit 1 ;;
+      %Lp) [ -e "${3:-}" ] && either %a %Lp "$3" && exit 0; exit 1 ;;
+      %l)  [ -e "${3:-}" ] && either %h %l "$3" && exit 0; exit 1 ;;
     esac
     ;;
   -c)
@@ -692,7 +718,7 @@ test_neutral_identity_comes_from_one_shared_helper() {
   local stub_bin binding neutral expected out rc
   new_fixture shared-identity
   stub_bin="$TMP_ROOT/shared-identity/stubbin"
-  install_gnu_stat_stub "$stub_bin"
+  install_divergent_stat_host "$stub_bin"
 
   VERIFY_OUT=$(PATH="$stub_bin:$PATH" TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" \
     FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
@@ -723,6 +749,40 @@ test_neutral_identity_comes_from_one_shared_helper() {
 
   rm -rf "$neutral"
   pass "fm-verify: the neutral identity is produced and consumed by one shared helper"
+}
+
+# The verifier binding's filesystem identity is read once when a retained
+# binding is taken over, and read again under the capacity lock to prove no
+# other process swapped the file in between. An OS-branched reader returns
+# nothing at all on the host above, so the takeover refuses a binding sitting
+# right there, reporting that its identity cannot be read - a permanent stall on
+# a retry that should simply proceed, and one that no amount of reconciling the
+# named artifacts can clear. Both reads go through the shared helper.
+test_sidecar_identity_survives_a_divergent_stat_host() {
+  local stub_bin sidecar
+  new_fixture sidecar-identity
+  stub_bin="$TMP_ROOT/sidecar-identity/stubbin"
+  install_divergent_stat_host "$stub_bin"
+
+  # A retained binding with nothing left to reconcile: exactly what a previous
+  # verification leaves behind once its neutral directory, build worktree,
+  # container, and processes are all gone. Taking it over reads its identity.
+  sidecar="$FIX_HOME/state/demo-ship-verify.verify"
+  printf 'verifies=demo-ship\n' > "$sidecar"
+
+  VERIFY_OUT=$(PATH="$stub_bin:$PATH" TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" \
+    FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
+    --build-cmd "$BUILD_CMD" --artifact "$BUILD_ARTIFACT" 2>&1)
+  VERIFY_RC=$?
+  case "$VERIFY_OUT" in
+    *'binding identity cannot be read'*)
+      fail "the takeover refused a binding it can plainly see: $VERIFY_OUT" ;;
+  esac
+  expect_code 0 "$VERIFY_RC" \
+    "taking over a retained binding must read its identity through the shared helper (got: $VERIFY_OUT)"
+  assert_grep 'rev=' "$sidecar" "the taken-over binding must be rewritten for this verification"
+  pass "fm-verify: a retained binding is taken over where the stat flavor and uname disagree"
 }
 
 test_artifact_path_cannot_escape_through_a_symlinked_parent() {
@@ -1483,6 +1543,7 @@ test_spawn_handoff_persistence_failure_is_reported
 test_build_failure_is_a_result_without_a_spawn
 test_missing_artifact_after_a_clean_build_is_not_a_product_verdict
 test_neutral_identity_comes_from_one_shared_helper
+test_sidecar_identity_survives_a_divergent_stat_host
 test_artifact_path_cannot_escape_through_a_symlinked_parent
 test_artifact_descendant_symlink_must_stay_neutral
 test_artifact_internal_symlink_is_preserved

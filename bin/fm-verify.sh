@@ -265,7 +265,11 @@ if [ -e "$VERIFY_SIDECAR" ]; then
     echo "       reconcile task '$VERIFY_ID' before retrying" >&2
     exit 1
   fi
-  VERIFY_SIDECAR_IDENTITY=$(fm_pr_file_identity "$VERIFY_SIDECAR") || {
+  # Read through the shared probe-the-flavor helper, not a uname branch: this
+  # string is recorded here and compared again under the capacity lock below,
+  # and on a host whose `stat` flavor disagrees with `uname` a branching reader
+  # returns nothing at all, so the takeover refuses a binding it can plainly see.
+  VERIFY_SIDECAR_IDENTITY=$(fm_neutral_filesystem_identity "$VERIFY_SIDECAR") || {
     echo "error: verifier binding identity cannot be read at $VERIFY_SIDECAR" >&2
     exit 1
   }
@@ -655,7 +659,7 @@ if [ -e "$VERIFY_META" ] || [ -e "$VERIFY_BRIEF" ] || [ -e "$VERIFY_REPORT" ]; t
   exit 1
 fi
 if [ -n "$VERIFY_SIDECAR_IDENTITY" ]; then
-  CURRENT_SIDECAR_IDENTITY=$(fm_pr_file_identity "$VERIFY_SIDECAR" 2>/dev/null || true)
+  CURRENT_SIDECAR_IDENTITY=$(fm_neutral_filesystem_identity "$VERIFY_SIDECAR" 2>/dev/null || true)
   if [ "$CURRENT_SIDECAR_IDENTITY" != "$VERIFY_SIDECAR_IDENTITY" ]; then
     echo "error: verifier task id '$VERIFY_ID' became unavailable while reserving it" >&2
     exit 1
