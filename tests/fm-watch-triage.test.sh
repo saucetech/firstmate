@@ -563,10 +563,11 @@ test_stale_answered_needs_decision_superseded_by_resumed_run() {
   # then goes quiet again at a NEW hash. The per-distinct-hash gate must
   # re-consult the run-step and absorb again - never re-surface the
   # already-answered decision.
-  printf 'no-mistakes axi run: tests passing, ci next...' > "$capture_file"
+  printf 'no-mistakes axi run: tests passing, ci next...' > "$capture_file.tmp"
+  mv -f "$capture_file.tmp" "$capture_file"
   hash2=$(hash_text 'no-mistakes axi run: tests passing, ci next...')
   i=0
-  while [ "$i" -lt 80 ]; do
+  while [ "$i" -lt 200 ]; do
     [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$hash2" ] && break
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.1
@@ -585,16 +586,19 @@ test_stale_answered_needs_decision_superseded_by_resumed_run() {
 
 # The safety half of the same incident: the leftover needs-decision line must
 # keep surfacing whenever no ACTIVE run has moved past it. A run genuinely
-# parked at its gate (the decision is still awaited) and a crew with no readable
-# run at all (no-mistakes gone, timed out, or no matching run - the
-# reconciliation read fails toward surfacing) must both surface the terminal
+# parked at its gate (the decision is still awaited), a crew with no readable
+# run at all (no matching run, so the reconciliation reports unknown), and a
+# crew whose run-step read is outright unreadable (no-mistakes gone or timed
+# out, so the verdict is not even a "state:" line and crew_absorb_class's
+# malformed-verdict guard fails toward surfacing) must all surface the terminal
 # stale exactly as before.
 test_stale_needs_decision_without_active_run_still_surfaces() {
   local dir state fakebin out drain_out capture_file window key pane_hash sig pid verdict label
-  for label in parked-gate no-run; do
+  for label in parked-gate no-run unreadable-verdict; do
     case "$label" in
-      parked-gate) verdict='state: parked · source: run-step · parked at plan-approval: 1 finding(s)' ;;
-      no-run)      verdict='state: unknown · source: none · no current-state source available' ;;
+      parked-gate)        verdict='state: parked · source: run-step · parked at plan-approval: 1 finding(s)' ;;
+      no-run)             verdict='state: unknown · source: none · no current-state source available' ;;
+      unreadable-verdict) verdict='fatal: no-mistakes unavailable (timeout)' ;;
     esac
     dir=$(make_case "needs-decision-$label"); state="$dir/state"; fakebin="$dir/fakebin"
     out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
@@ -619,7 +623,7 @@ test_stale_needs_decision_without_active_run_still_surfaces() {
     grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "$label terminal stale was not queued"
   done
   unset FM_FAKE_CREW_STATE
-  pass "an unanswered needs-decision still surfaces: a parked gate and an unreadable run both fail toward surfacing"
+  pass "an unanswered needs-decision still surfaces: a parked gate, no readable run, and an unreadable verdict all fail toward surfacing"
 }
 
 # --- non-terminal stale, crew provably working: absorbed, then wedge-escalated ---
