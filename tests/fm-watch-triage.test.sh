@@ -515,6 +515,113 @@ test_stale_terminal_status_overridden_by_active_run() {
   pass "a stale terminal-looking status is overridden and absorbed while a run is actively working, then wedge-escalated"
 }
 
+# --- stale pane, ANSWERED needs-decision superseded by the resumed run --------
+# Regression for the 2026-08-05/09 re-surfaced-decision incidents: a crew appends
+# needs-decision:, firstmate answers, the crew feeds the decision to its gate and
+# the run resumes validating - but the status log is append-only, so its LAST
+# line still reads needs-decision: until the crew writes a newer line. The
+# terminal-stale path used to trust that leftover line per distinct quiet-pane
+# hash, so a working pane that kept changing and re-quieting re-surfaced the
+# already-answered decision as a fresh terminal stale on every new hash, each
+# fire costing a full supervision turn. The run-step reconciliation
+# (crew_is_provably_working over fm-crew-state.sh, which reports "status-log
+# superseded by active run" for exactly this state) must absorb it instead - on
+# the first quiet hash and again on every later one.
+test_stale_answered_needs_decision_superseded_by_resumed_run() {
+  local dir state fakebin out capture_file window key hash1 hash2 sig pid i
+  dir=$(make_case answered-decision-superseded); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-answered"
+  printf 'no-mistakes axi respond: decision fed, validating...' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/answered.meta"
+  # The append-only log: the crew asked, firstmate answered out-of-band (the
+  # answer goes to the gate, never to this log), the run resumed. The LAST line
+  # stays needs-decision: for the rest of the validation.
+  printf 'working: implementing\nneeds-decision: pick migration A or B\n' > "$state/answered.status"
+  sig=$(seen_sig "$state/answered.status"); printf '%s' "$sig" > "$state/.seen-answered_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  hash1=$(hash_text 'no-mistakes axi respond: decision fed, validating...')
+  printf '%s' "$hash1" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # The decision was already fed back: the branch-matched run is active again.
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running) · status-log superseded by active run'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher exited for an answered needs-decision whose run resumed (should absorb): $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "answered needs-decision printed a wake reason while the run is active: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "answered needs-decision enqueued a wake while the run is active"
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$hash1" ] || fail "stale suppressor not advanced on the first quiet hash"
+  [ -s "$state/.stale-since-$key" ] || fail "wedge timer was not armed on the absorbed quiet hash"
+  [ ! -e "$state/.hb-surfaced-answered" ] || fail "an absorbed answered decision must not mark the status line surfaced"
+
+  # The live re-fire shape: the working pane changes (the run streams output),
+  # then goes quiet again at a NEW hash. The per-distinct-hash gate must
+  # re-consult the run-step and absorb again - never re-surface the
+  # already-answered decision.
+  printf 'no-mistakes axi run: tests passing, ci next...' > "$capture_file"
+  hash2=$(hash_text 'no-mistakes axi run: tests passing, ci next...')
+  i=0
+  while [ "$i" -lt 80 ]; do
+    [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$hash2" ] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if ! is_live_non_zombie "$pid"; then
+    reap "$pid"; fail "watcher exited when the answered decision re-quieted at a new hash (should absorb again): $(cat "$out")"
+  fi
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$hash2" ] || { reap "$pid"; fail "stale suppressor did not advance to the second quiet hash"; }
+  [ ! -s "$out" ] || { reap "$pid"; fail "the second quiet hash re-surfaced the answered decision: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "the second quiet hash enqueued a wake for the answered decision"; }
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "an answered needs-decision with a resumed run is absorbed on every distinct quiet hash, never re-surfaced"
+}
+
+# The safety half of the same incident: the leftover needs-decision line must
+# keep surfacing whenever no ACTIVE run has moved past it. A run genuinely
+# parked at its gate (the decision is still awaited) and a crew with no readable
+# run at all (no-mistakes gone, timed out, or no matching run - the
+# reconciliation read fails toward surfacing) must both surface the terminal
+# stale exactly as before.
+test_stale_needs_decision_without_active_run_still_surfaces() {
+  local dir state fakebin out drain_out capture_file window key pane_hash sig pid verdict label
+  for label in parked-gate no-run; do
+    case "$label" in
+      parked-gate) verdict='state: parked · source: run-step · parked at plan-approval: 1 finding(s)' ;;
+      no-run)      verdict='state: unknown · source: none · no current-state source available' ;;
+    esac
+    dir=$(make_case "needs-decision-$label"); state="$dir/state"; fakebin="$dir/fakebin"
+    out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+    window="test:fm-waiting"
+    printf 'gate prompt idle (%s)' "$label" > "$capture_file"
+    printf 'window=%s\nkind=ship\n' "$window" > "$state/waiting.meta"
+    printf 'working: implementing\nneeds-decision: pick migration A or B\n' > "$state/waiting.status"
+    sig=$(seen_sig "$state/waiting.status"); printf '%s' "$sig" > "$state/.seen-waiting_status"
+    key=$(printf '%s' "$window" | tr ':/.' '___')
+    pane_hash=$(hash_text "gate prompt idle ($label)")
+    printf '%s' "$pane_hash" > "$state/.hash-$key"
+    printf '1\n' > "$state/.count-$key"
+    export FM_FAKE_CREW_STATE="$verdict"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    wait_for_exit "$pid" 40 || fail "watcher did not surface a needs-decision stale with $label"
+    grep -Fx "stale: $window" "$out" >/dev/null || fail "watcher did not print the terminal stale wake ($label): $(cat "$out")"
+    [ -s "$state/.hb-surfaced-waiting" ] || fail "surfaced needs-decision stale did not record the surfaced marker ($label)"
+    FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the $label stale failed"
+    grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "$label terminal stale was not queued"
+  done
+  unset FM_FAKE_CREW_STATE
+  pass "an unanswered needs-decision still surfaces: a parked gate and an unreadable run both fail toward surfacing"
+}
+
 # --- non-terminal stale, crew provably working: absorbed, then wedge-escalated ---
 # A provably-working crew (an actively-running pipeline) legitimately sits on a
 # static pane (e.g. waiting on CI), so a non-terminal stale is absorbed and only
@@ -1814,6 +1921,8 @@ test_working_note_not_working_surfaced
 test_actionable_signal_surfaced
 test_terminal_stale_surfaced
 test_stale_terminal_status_overridden_by_active_run
+test_stale_answered_needs_decision_superseded_by_resumed_run
+test_stale_needs_decision_without_active_run_still_surfaces
 test_nonterminal_stale_provably_working_absorbed_then_escalated
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold
 test_wedge_escalation_resets_when_pane_becomes_active
