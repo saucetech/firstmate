@@ -8,9 +8,13 @@
 # provably-working no-verb wakes absorbed (no exit, no queue entry, suppressor
 # advanced, beacon fresh), stopped-crew no-verb wakes surfaced (queue + exit),
 # provably-working stale panes absorbed-then-escalated past the threshold,
-# terminal-looking stale status lines overridden by an active run, the heartbeat
-# backstop fail-safe, and afk coherence (no double-triage while the away-mode
-# daemon owns supervision).
+# terminal-looking stale status lines overridden by an active run - including an
+# already-answered needs-decision left as the log's last line, absorbed again on
+# every later distinct quiet hash rather than re-surfaced, and its fail-safe
+# counterpart, which still surfaces whenever no active run outranks that line
+# (parked gate, no readable run, unreadable verdict) - the heartbeat backstop
+# fail-safe, and afk coherence (no double-triage while the away-mode daemon owns
+# supervision).
 #
 # Daemon-side classification/injection lives in fm-daemon.test.sh; watcher/lock
 # liveness in fm-watcher-lock.test.sh; the durable-queue safety matrix in
@@ -509,11 +513,23 @@ test_stale_terminal_status_overridden_by_active_run() {
   if ! wait_live "$pid" 30; then
     reap "$pid"; fail "watcher exited for a stale terminal-looking status the run-step overrides (should absorb): $(cat "$out")"
   fi
-  [ ! -s "$out" ] || fail "the overridden stale terminal status printed a wake reason during absorb"
-  [ ! -s "$state/.wake-queue" ] || fail "the overridden stale terminal status enqueued a wake during absorb"
-  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on absorb"
-  [ -s "$state/.stale-since-$key" ] || fail "stale-since escalation timer was not recorded on absorb"
-  [ ! -e "$state/.hb-surfaced-validating" ] || fail "an absorbed wake must not mark the status line as surfaced"
+  # Same loaded-machine race the sibling absorb tests guard against: surviving
+  # 3s is not proof the absorb LANDED, because the first poll cycle forks a
+  # helper per step and can finish after that fixed wait. Wait for the triage
+  # line the override branch appends LAST - after the suppressor and the wedge
+  # timer - so the assertions below read a COMPLETED absorb. A regression still
+  # fails: a surface exits the watcher, which the liveness re-check catches, and
+  # every assertion still runs afterwards.
+  wait_log_count "$state/.watch-triage.log" 'overriding a stale captain-relevant status' 1 200 \
+    || { reap "$pid"; fail "the overridden stale terminal status was not absorbed; wake=[$(cat "$out" 2>/dev/null || true)] triage=[$(cat "$state/.watch-triage.log" 2>/dev/null || true)]"; }
+  if ! is_live_non_zombie "$pid"; then
+    reap "$pid"; fail "watcher exited for a stale terminal-looking status the run-step overrides (should absorb): $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "the overridden stale terminal status printed a wake reason during absorb"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "the overridden stale terminal status enqueued a wake during absorb"; }
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || { reap "$pid"; fail "stale suppressor not advanced on absorb"; }
+  [ -s "$state/.stale-since-$key" ] || { reap "$pid"; fail "stale-since escalation timer was not recorded on absorb"; }
+  [ ! -e "$state/.hb-surfaced-validating" ] || { reap "$pid"; fail "an absorbed wake must not mark the status line as surfaced"; }
   reap "$pid"
 
   # Phase B: backdate the idle timer past the threshold; the run genuinely
@@ -524,7 +540,10 @@ test_stale_terminal_status_overridden_by_active_run() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_for_exit "$pid" 40 || fail "watcher did not escalate an overridden stale terminal status past the threshold"
+  # Same loaded-machine budget as the absorb tests: escalating costs a poll
+  # cycle plus the run-step read. Reap before failing so a missed escalation
+  # never leaks an FM_POLL=1 watcher that keeps polling deleted temp state.
+  wait_for_exit "$pid" 200 || { reap "$pid"; fail "watcher did not escalate an overridden stale terminal status past the threshold"; }
   grep -F "stale: $window" "$out" >/dev/null || fail "escalation did not print a stale wake"
   grep -F "possible wedge" "$out" >/dev/null || fail "escalation did not flag a possible wedge"
   unset FM_FAKE_CREW_STATE
