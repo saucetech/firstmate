@@ -8,9 +8,13 @@
 # provably-working no-verb wakes absorbed (no exit, no queue entry, suppressor
 # advanced, beacon fresh), stopped-crew no-verb wakes surfaced (queue + exit),
 # provably-working stale panes absorbed-then-escalated past the threshold,
-# terminal-looking stale status lines overridden by an active run, the heartbeat
-# backstop fail-safe, and afk coherence (no double-triage while the away-mode
-# daemon owns supervision).
+# terminal-looking stale status lines overridden by an active run - including an
+# already-answered needs-decision left as the log's last line, absorbed again on
+# every later distinct quiet hash rather than re-surfaced, and its fail-safe
+# counterpart, which still surfaces whenever no active run outranks that line
+# (parked gate, no readable run, unreadable verdict) - the heartbeat backstop
+# fail-safe, and afk coherence (no double-triage while the away-mode daemon owns
+# supervision).
 #
 # Daemon-side classification/injection lives in fm-daemon.test.sh; watcher/lock
 # liveness in fm-watcher-lock.test.sh; the durable-queue safety matrix in
@@ -48,6 +52,22 @@ wait_live() {
     i=$((i + 1))
   done
   return 0
+}
+
+# Wait up to <limit> 0.1s ticks until <file> holds at least <count> lines
+# containing the fixed string <pattern>. The watcher appends its triage line
+# just after the state files a test asserts on, so reading the log the moment
+# those files land can race the append.
+wait_log_count() {  # <file> <pattern> <count> [limit]
+  local file=$1 pat=$2 want=$3 limit=${4:-50} i=0 have
+  while [ "$i" -lt "$limit" ]; do
+    have=$(grep -cF "$pat" "$file" 2>/dev/null || true)
+    case "$have" in ''|*[!0-9]*) have=0 ;; esac
+    [ "$have" -ge "$want" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
 }
 
 wait_numeric_file() {
@@ -493,11 +513,23 @@ test_stale_terminal_status_overridden_by_active_run() {
   if ! wait_live "$pid" 30; then
     reap "$pid"; fail "watcher exited for a stale terminal-looking status the run-step overrides (should absorb): $(cat "$out")"
   fi
-  [ ! -s "$out" ] || fail "the overridden stale terminal status printed a wake reason during absorb"
-  [ ! -s "$state/.wake-queue" ] || fail "the overridden stale terminal status enqueued a wake during absorb"
-  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on absorb"
-  [ -s "$state/.stale-since-$key" ] || fail "stale-since escalation timer was not recorded on absorb"
-  [ ! -e "$state/.hb-surfaced-validating" ] || fail "an absorbed wake must not mark the status line as surfaced"
+  # Same loaded-machine race the sibling absorb tests guard against: surviving
+  # 3s is not proof the absorb LANDED, because the first poll cycle forks a
+  # helper per step and can finish after that fixed wait. Wait for the triage
+  # line the override branch appends LAST - after the suppressor and the wedge
+  # timer - so the assertions below read a COMPLETED absorb. A regression still
+  # fails: a surface exits the watcher, which the liveness re-check catches, and
+  # every assertion still runs afterwards.
+  wait_log_count "$state/.watch-triage.log" 'overriding a stale captain-relevant status' 1 200 \
+    || { reap "$pid"; fail "the overridden stale terminal status was not absorbed; wake=[$(cat "$out" 2>/dev/null || true)] triage=[$(cat "$state/.watch-triage.log" 2>/dev/null || true)]"; }
+  if ! is_live_non_zombie "$pid"; then
+    reap "$pid"; fail "watcher exited for a stale terminal-looking status the run-step overrides (should absorb): $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "the overridden stale terminal status printed a wake reason during absorb"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "the overridden stale terminal status enqueued a wake during absorb"; }
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || { reap "$pid"; fail "stale suppressor not advanced on absorb"; }
+  [ -s "$state/.stale-since-$key" ] || { reap "$pid"; fail "stale-since escalation timer was not recorded on absorb"; }
+  [ ! -e "$state/.hb-surfaced-validating" ] || { reap "$pid"; fail "an absorbed wake must not mark the status line as surfaced"; }
   reap "$pid"
 
   # Phase B: backdate the idle timer past the threshold; the run genuinely
@@ -508,11 +540,158 @@ test_stale_terminal_status_overridden_by_active_run() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_for_exit "$pid" 40 || fail "watcher did not escalate an overridden stale terminal status past the threshold"
+  # Same loaded-machine budget as the absorb tests: escalating costs a poll
+  # cycle plus the run-step read. Reap before failing so a missed escalation
+  # never leaks an FM_POLL=1 watcher that keeps polling deleted temp state.
+  wait_for_exit "$pid" 200 || { reap "$pid"; fail "watcher did not escalate an overridden stale terminal status past the threshold"; }
   grep -F "stale: $window" "$out" >/dev/null || fail "escalation did not print a stale wake"
   grep -F "possible wedge" "$out" >/dev/null || fail "escalation did not flag a possible wedge"
   unset FM_FAKE_CREW_STATE
   pass "a stale terminal-looking status is overridden and absorbed while a run is actively working, then wedge-escalated"
+}
+
+# --- stale pane, ANSWERED needs-decision superseded by the resumed run --------
+# Regression for the 2026-08-05/09 re-surfaced-decision incidents: a crew appends
+# needs-decision:, firstmate answers, the crew feeds the decision to its gate and
+# the run resumes validating - but the status log is append-only, so its LAST
+# line still reads needs-decision: until the crew writes a newer line. The
+# terminal-stale path used to trust that leftover line per distinct quiet-pane
+# hash, so a working pane that kept changing and re-quieting re-surfaced the
+# already-answered decision as a fresh terminal stale on every new hash, each
+# fire costing a full supervision turn. The run-step reconciliation
+# (crew_is_provably_working over fm-crew-state.sh, which reports "status-log
+# superseded by active run" for exactly this state) must absorb it instead - on
+# the first quiet hash and again on every later one.
+test_stale_answered_needs_decision_superseded_by_resumed_run() {
+  local dir state fakebin out capture_file window key hash1 hash2 sig pid i
+  local triage override_msg nonterminal_msg
+  dir=$(make_case answered-decision-superseded); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; triage="$state/.watch-triage.log"
+  # The two absorb branches leave byte-identical state behind, so only the
+  # triage line tells them apart: the terminal-stale override under test versus
+  # the ordinary non-terminal absorb.
+  override_msg='overriding a stale captain-relevant status'
+  nonterminal_msg='absorbed non-terminal stale (provably working)'
+  window="test:fm-answered"
+  printf 'no-mistakes axi respond: decision fed, validating...' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/answered.meta"
+  # The append-only log: the crew asked, firstmate answered out-of-band (the
+  # answer goes to the gate, never to this log), the run resumed. The LAST line
+  # stays needs-decision: for the rest of the validation.
+  printf 'working: implementing\nneeds-decision: pick migration A or B\n' > "$state/answered.status"
+  sig=$(seen_sig "$state/answered.status"); printf '%s' "$sig" > "$state/.seen-answered_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  hash1=$(hash_text 'no-mistakes axi respond: decision fed, validating...')
+  printf '%s' "$hash1" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # The decision was already fed back: the branch-matched run is active again.
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running) · status-log superseded by active run'
+  # The fixture only pins this regression while the leftover needs-decision line
+  # still routes the quiet pane into the terminal-stale branch.
+  stale_is_terminal "$window" "$state" \
+    || fail "the answered needs-decision fixture is no longer classified a terminal stale, so the absorb below no longer exercises the override branch"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher exited for an answered needs-decision whose run resumed (should absorb): $(cat "$out")"
+  fi
+  # The absorb needs a full poll cycle (pane capture, run-step read, suppressor
+  # write, timer write, triage append), each step forking a helper, so on a
+  # loaded machine it outlasts the fixed liveness wait above. Wait for the
+  # triage line, which the override branch writes LAST - after both the
+  # suppressor and the wedge timer - so the state assertions below read a
+  # COMPLETED absorb rather than a half-written one. Waiting cannot mask a
+  # regression: a re-surface exits the watcher, which the wait detects at once,
+  # and every no-output/no-queue/no-marker assertion still runs afterwards.
+  wait_log_count "$triage" "$override_msg" 1 200 \
+    || { reap "$pid"; fail "the first quiet hash was not absorbed by the terminal-stale override branch; wake=[$(cat "$out" 2>/dev/null || true)] triage=[$(cat "$triage" 2>/dev/null || true)]"; }
+  if ! is_live_non_zombie "$pid"; then
+    reap "$pid"; fail "watcher exited for an answered needs-decision whose run resumed (should absorb): $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "answered needs-decision printed a wake reason while the run is active: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "answered needs-decision enqueued a wake while the run is active"; }
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$hash1" ] || { reap "$pid"; fail "stale suppressor not advanced on the first quiet hash"; }
+  [ -s "$state/.stale-since-$key" ] || { reap "$pid"; fail "wedge timer was not armed on the absorbed quiet hash"; }
+  [ ! -e "$state/.hb-surfaced-answered" ] || { reap "$pid"; fail "an absorbed answered decision must not mark the status line surfaced"; }
+  ! grep -F "$nonterminal_msg" "$triage" >/dev/null 2>&1 \
+    || { reap "$pid"; fail "the first quiet hash took the ordinary non-terminal absorb instead of the terminal-stale override: $(cat "$triage")"; }
+
+  # The live re-fire shape: the working pane changes (the run streams output),
+  # then goes quiet again at a NEW hash. The per-distinct-hash gate must
+  # re-consult the run-step and absorb again - never re-surface the
+  # already-answered decision.
+  printf 'no-mistakes axi run: tests passing, ci next...' > "$capture_file.tmp"
+  mv -f "$capture_file.tmp" "$capture_file"
+  hash2=$(hash_text 'no-mistakes axi run: tests passing, ci next...')
+  i=0
+  while [ "$i" -lt 200 ]; do
+    [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$hash2" ] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if ! is_live_non_zombie "$pid"; then
+    reap "$pid"; fail "watcher exited when the answered decision re-quieted at a new hash (should absorb again): $(cat "$out")"
+  fi
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$hash2" ] || { reap "$pid"; fail "stale suppressor did not advance to the second quiet hash"; }
+  [ ! -s "$out" ] || { reap "$pid"; fail "the second quiet hash re-surfaced the answered decision: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "the second quiet hash enqueued a wake for the answered decision"; }
+  wait_log_count "$triage" "$override_msg" 2 200 \
+    || { reap "$pid"; fail "the second quiet hash was not absorbed by the terminal-stale override branch: $(cat "$triage" 2>/dev/null || true)"; }
+  ! grep -F "$nonterminal_msg" "$triage" >/dev/null 2>&1 \
+    || { reap "$pid"; fail "the second quiet hash took the ordinary non-terminal absorb instead of the terminal-stale override: $(cat "$triage")"; }
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "an answered needs-decision with a resumed run is absorbed on every distinct quiet hash, never re-surfaced"
+}
+
+# The safety half of the same incident: the leftover needs-decision line must
+# keep surfacing whenever no ACTIVE run has moved past it. A run genuinely
+# parked at its gate (the decision is still awaited), a crew with no readable
+# run at all (no matching run, so the reconciliation reports unknown), and a
+# crew whose run-step read is outright unreadable (no-mistakes gone or timed
+# out, so the verdict is not even a "state:" line and crew_absorb_class's
+# malformed-verdict guard fails toward surfacing) must all surface the terminal
+# stale exactly as before.
+test_stale_needs_decision_without_active_run_still_surfaces() {
+  local dir state fakebin out drain_out capture_file window key pane_hash sig pid verdict label
+  for label in parked-gate no-run unreadable-verdict; do
+    case "$label" in
+      parked-gate)        verdict='state: parked · source: run-step · parked at plan-approval: 1 finding(s)' ;;
+      no-run)             verdict='state: unknown · source: none · no current-state source available' ;;
+      unreadable-verdict) verdict='fatal: no-mistakes unavailable (timeout)' ;;
+    esac
+    dir=$(make_case "needs-decision-$label"); state="$dir/state"; fakebin="$dir/fakebin"
+    out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+    window="test:fm-waiting"
+    printf 'gate prompt idle (%s)' "$label" > "$capture_file"
+    printf 'window=%s\nkind=ship\n' "$window" > "$state/waiting.meta"
+    printf 'working: implementing\nneeds-decision: pick migration A or B\n' > "$state/waiting.status"
+    sig=$(seen_sig "$state/waiting.status"); printf '%s' "$sig" > "$state/.seen-waiting_status"
+    key=$(printf '%s' "$window" | tr ':/.' '___')
+    pane_hash=$(hash_text "gate prompt idle ($label)")
+    printf '%s' "$pane_hash" > "$state/.hash-$key"
+    printf '1\n' > "$state/.count-$key"
+    export FM_FAKE_CREW_STATE="$verdict"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    # Same loaded-machine budget as the absorb test above: surfacing costs a
+    # poll cycle plus the run-step read. Reap before failing so a missed
+    # surface never leaks an FM_POLL=1 watcher that keeps polling deleted
+    # temp state and slows every later run.
+    wait_for_exit "$pid" 200 || { reap "$pid"; fail "watcher did not surface a needs-decision stale with $label"; }
+    grep -Fx "stale: $window" "$out" >/dev/null || fail "watcher did not print the terminal stale wake ($label): $(cat "$out")"
+    [ -s "$state/.hb-surfaced-waiting" ] || fail "surfaced needs-decision stale did not record the surfaced marker ($label)"
+    FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the $label stale failed"
+    grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "$label terminal stale was not queued"
+  done
+  unset FM_FAKE_CREW_STATE
+  pass "an unanswered needs-decision still surfaces: a parked gate, no readable run, and an unreadable verdict all fail toward surfacing"
 }
 
 # --- non-terminal stale, crew provably working: absorbed, then wedge-escalated ---
@@ -522,8 +701,11 @@ test_stale_terminal_status_overridden_by_active_run() {
 
 test_nonterminal_stale_provably_working_absorbed_then_escalated() {
   local dir state fakebin out drain_out capture_file window key pane_hash sig pid
+  local triage absorb_msg
   dir=$(make_case nonterminal-stale-working); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  triage="$state/.watch-triage.log"
+  absorb_msg='absorbed non-terminal stale (provably working)'
   window="test:fm-quiet"
   printf 'idle building output' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/quiet.meta"
@@ -546,10 +728,25 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated() {
   if ! wait_live "$pid" 30; then
     reap "$pid"; fail "watcher exited for a fresh provably-working non-terminal stale (should absorb): $(cat "$out")"
   fi
-  [ ! -s "$out" ] || fail "fresh provably-working stale printed a wake reason during absorb"
-  [ ! -s "$state/.wake-queue" ] || fail "fresh provably-working stale enqueued a wake during absorb"
-  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on absorb"
-  [ -s "$state/.stale-since-$key" ] || fail "stale-since escalation timer was not recorded on absorb"
+  # Staying alive for 3s does not mean the absorb LANDED: the first poll cycle
+  # (pane capture, crew-state read, suppressor write, timer write, triage
+  # append) forks a helper per step, so on a loaded machine it finishes after
+  # that fixed wait and the assertions below then read an empty state dir. Wait
+  # for the triage line, which this branch appends LAST - after both the
+  # suppressor and the wedge timer - so the assertions see a COMPLETED absorb.
+  # Waiting cannot mask a regression: a surface exits the watcher, which the
+  # liveness re-check catches at once, and every assertion still runs after.
+  wait_log_count "$triage" "$absorb_msg" 1 200 \
+    || { reap "$pid"; fail "the first sighting was not absorbed as a provably-working non-terminal stale; wake=[$(cat "$out" 2>/dev/null || true)] triage=[$(cat "$triage" 2>/dev/null || true)]"; }
+  if ! is_live_non_zombie "$pid"; then
+    reap "$pid"; fail "watcher exited for a fresh provably-working non-terminal stale (should absorb): $(cat "$out")"
+  fi
+  # Reap before every failure so a miss never leaks an FM_POLL=1 watcher that
+  # keeps polling deleted temp state and slows every later run.
+  [ ! -s "$out" ] || { reap "$pid"; fail "fresh provably-working stale printed a wake reason during absorb"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "fresh provably-working stale enqueued a wake during absorb"; }
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || { reap "$pid"; fail "stale suppressor not advanced on absorb"; }
+  [ -s "$state/.stale-since-$key" ] || { reap "$pid"; fail "stale-since escalation timer was not recorded on absorb"; }
   reap "$pid"
 
   # Phase B: backdate the idle timer past the threshold; the next run escalates.
@@ -618,8 +815,11 @@ test_nonterminal_stale_not_working_surfaced() {
 # for a recheck, so a forgotten pause cannot rot invisibly.
 test_nonterminal_stale_paused_absorbed_then_resurfaced() {
   local dir state fakebin out drain_out capture_file window key pane_hash sig pid back statusf
+  local triage absorb_msg
   dir=$(make_case nonterminal-stale-paused); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  triage="$state/.watch-triage.log"
+  absorb_msg='absorbed stale (paused, awaiting external'
   window="test:fm-held"
   printf 'idle, holding for upstream' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/held.meta"
@@ -645,11 +845,25 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
   if ! wait_live "$pid" 30; then
     reap "$pid"; fail "watcher exited for a fresh declared pause (should absorb): $(cat "$out")"
   fi
-  [ ! -s "$out" ] || fail "fresh paused stale printed a wake reason during absorb"
-  [ ! -s "$state/.wake-queue" ] || fail "fresh paused stale enqueued a wake during absorb"
-  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on paused absorb"
-  [ -e "$state/.paused-$key" ] || fail "paused flag not recorded on absorb"
-  [ ! -e "$state/.stale-since-$key" ] || fail "a paused absorb must not start the wedge timer"
+  # Surviving 3s does not mean the paused absorb LANDED: the first poll cycle
+  # forks a helper per step, so under load it finishes after that fixed wait and
+  # the assertions below then read an untouched state dir. Wait for the triage
+  # line, which handle_paused_stale appends LAST - after the suppressor, the
+  # paused flag and the wedge-timer removal - so the assertions see a COMPLETED
+  # absorb. Waiting cannot mask a regression: a re-surface exits the watcher,
+  # which the liveness re-check catches, and every assertion still runs after.
+  wait_log_count "$triage" "$absorb_msg" 1 200 \
+    || { reap "$pid"; fail "the fresh declared pause was not absorbed; wake=[$(cat "$out" 2>/dev/null || true)] triage=[$(cat "$triage" 2>/dev/null || true)]"; }
+  if ! is_live_non_zombie "$pid"; then
+    reap "$pid"; fail "watcher exited for a fresh declared pause (should absorb): $(cat "$out")"
+  fi
+  # Reap before every failure so a miss never leaks an FM_POLL=1 watcher that
+  # keeps polling deleted temp state and slows every later run.
+  [ ! -s "$out" ] || { reap "$pid"; fail "fresh paused stale printed a wake reason during absorb"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "fresh paused stale enqueued a wake during absorb"; }
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || { reap "$pid"; fail "stale suppressor not advanced on paused absorb"; }
+  [ -e "$state/.paused-$key" ] || { reap "$pid"; fail "paused flag not recorded on absorb"; }
+  [ ! -e "$state/.stale-since-$key" ] || { reap "$pid"; fail "a paused absorb must not start the wedge timer"; }
   reap "$pid"
 
   # Phase B: age the pause past the (now normal) threshold by backdating its
@@ -840,7 +1054,7 @@ test_secondmate_nonpaused_stale_remains_suppressed() {
 }
 
 test_secondmate_unpause_clears_pause_tracking() {
-  local dir state fakebin out statusf window key pid
+  local dir state fakebin out statusf window key pid i
   dir=$(make_case secondmate-unpause-clears); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; statusf="$state/secondmate-resumed.status"; window="test:fm-secondmate-resumed"
   printf 'window=%s\nkind=secondmate\n' "$window" > "$state/secondmate-resumed.meta"
@@ -858,6 +1072,21 @@ test_secondmate_unpause_clears_pause_tracking() {
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
   wait_live "$pid" 20 || fail "watcher exited while reconciling a resumed secondmate: $(cat "$out")"
+  # Surviving 2s is not proof the reconciliation RAN: clear_pause_tracking only
+  # fires on the first poll, which on a loaded machine lands after that fixed
+  # wait, leaving the assertions below to read the still-primed markers. It
+  # removes the pause markers first and the wedge counter LAST, so wait
+  # (bounded) for the wedge counter to disappear and the assertions then see a
+  # COMPLETED reconciliation. A watcher that never clears them still fails: the
+  # wait expires and every assertion below runs unchanged.
+  i=0
+  while [ "$i" -lt 200 ] && [ -e "$state/.wedge-escalations-$key" ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  is_live_non_zombie "$pid" \
+    || { reap "$pid"; fail "watcher exited while reconciling a resumed secondmate: $(cat "$out")"; }
   [ ! -e "$state/.paused-$key" ] || { reap "$pid"; fail "resumed secondmate retained the pause marker"; }
   [ ! -e "$state/.stale-$key" ] || { reap "$pid"; fail "resumed secondmate retained stale tracking"; }
   [ ! -e "$state/.wedge-escalations-$key" ] || { reap "$pid"; fail "resumed secondmate retained wedge tracking"; }
@@ -1814,6 +2043,8 @@ test_working_note_not_working_surfaced
 test_actionable_signal_surfaced
 test_terminal_stale_surfaced
 test_stale_terminal_status_overridden_by_active_run
+test_stale_answered_needs_decision_superseded_by_resumed_run
+test_stale_needs_decision_without_active_run_still_surfaces
 test_nonterminal_stale_provably_working_absorbed_then_escalated
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold
 test_wedge_escalation_resets_when_pane_becomes_active
