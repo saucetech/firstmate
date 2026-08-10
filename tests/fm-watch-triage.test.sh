@@ -50,6 +50,22 @@ wait_live() {
   return 0
 }
 
+# Wait up to <limit> 0.1s ticks until <file> holds at least <count> lines
+# containing the fixed string <pattern>. The watcher appends its triage line
+# just after the state files a test asserts on, so reading the log the moment
+# those files land can race the append.
+wait_log_count() {  # <file> <pattern> <count> [limit]
+  local file=$1 pat=$2 want=$3 limit=${4:-50} i=0 have
+  while [ "$i" -lt "$limit" ]; do
+    have=$(grep -cF "$pat" "$file" 2>/dev/null || true)
+    case "$have" in ''|*[!0-9]*) have=0 ;; esac
+    [ "$have" -ge "$want" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
 wait_numeric_file() {
   local file=$1 limit=${2:-30} i=0 value
   while [ "$i" -lt "$limit" ]; do
@@ -529,8 +545,14 @@ test_stale_terminal_status_overridden_by_active_run() {
 # the first quiet hash and again on every later one.
 test_stale_answered_needs_decision_superseded_by_resumed_run() {
   local dir state fakebin out capture_file window key hash1 hash2 sig pid i
+  local triage override_msg nonterminal_msg
   dir=$(make_case answered-decision-superseded); state="$dir/state"; fakebin="$dir/fakebin"
-  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; triage="$state/.watch-triage.log"
+  # The two absorb branches leave byte-identical state behind, so only the
+  # triage line tells them apart: the terminal-stale override under test versus
+  # the ordinary non-terminal absorb.
+  override_msg='overriding a stale captain-relevant status'
+  nonterminal_msg='absorbed non-terminal stale (provably working)'
   window="test:fm-answered"
   printf 'no-mistakes axi respond: decision fed, validating...' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/answered.meta"
@@ -545,6 +567,10 @@ test_stale_answered_needs_decision_superseded_by_resumed_run() {
   printf '1\n' > "$state/.count-$key"
   # The decision was already fed back: the branch-matched run is active again.
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running) · status-log superseded by active run'
+  # The fixture only pins this regression while the leftover needs-decision line
+  # still routes the quiet pane into the terminal-stale branch.
+  stale_is_terminal "$window" "$state" \
+    || fail "the answered needs-decision fixture is no longer classified a terminal stale, so the absorb below no longer exercises the override branch"
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
@@ -553,11 +579,15 @@ test_stale_answered_needs_decision_superseded_by_resumed_run() {
   if ! wait_live "$pid" 30; then
     reap "$pid"; fail "watcher exited for an answered needs-decision whose run resumed (should absorb): $(cat "$out")"
   fi
-  [ ! -s "$out" ] || fail "answered needs-decision printed a wake reason while the run is active: $(cat "$out")"
-  [ ! -s "$state/.wake-queue" ] || fail "answered needs-decision enqueued a wake while the run is active"
-  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$hash1" ] || fail "stale suppressor not advanced on the first quiet hash"
-  [ -s "$state/.stale-since-$key" ] || fail "wedge timer was not armed on the absorbed quiet hash"
-  [ ! -e "$state/.hb-surfaced-answered" ] || fail "an absorbed answered decision must not mark the status line surfaced"
+  [ ! -s "$out" ] || { reap "$pid"; fail "answered needs-decision printed a wake reason while the run is active: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "answered needs-decision enqueued a wake while the run is active"; }
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$hash1" ] || { reap "$pid"; fail "stale suppressor not advanced on the first quiet hash"; }
+  [ -s "$state/.stale-since-$key" ] || { reap "$pid"; fail "wedge timer was not armed on the absorbed quiet hash"; }
+  [ ! -e "$state/.hb-surfaced-answered" ] || { reap "$pid"; fail "an absorbed answered decision must not mark the status line surfaced"; }
+  wait_log_count "$triage" "$override_msg" 1 30 \
+    || { reap "$pid"; fail "the first quiet hash was not absorbed by the terminal-stale override branch: $(cat "$triage" 2>/dev/null || true)"; }
+  ! grep -F "$nonterminal_msg" "$triage" >/dev/null 2>&1 \
+    || { reap "$pid"; fail "the first quiet hash took the ordinary non-terminal absorb instead of the terminal-stale override: $(cat "$triage")"; }
 
   # The live re-fire shape: the working pane changes (the run streams output),
   # then goes quiet again at a NEW hash. The per-distinct-hash gate must
@@ -579,6 +609,10 @@ test_stale_answered_needs_decision_superseded_by_resumed_run() {
   [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$hash2" ] || { reap "$pid"; fail "stale suppressor did not advance to the second quiet hash"; }
   [ ! -s "$out" ] || { reap "$pid"; fail "the second quiet hash re-surfaced the answered decision: $(cat "$out")"; }
   [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "the second quiet hash enqueued a wake for the answered decision"; }
+  wait_log_count "$triage" "$override_msg" 2 30 \
+    || { reap "$pid"; fail "the second quiet hash was not absorbed by the terminal-stale override branch: $(cat "$triage" 2>/dev/null || true)"; }
+  ! grep -F "$nonterminal_msg" "$triage" >/dev/null 2>&1 \
+    || { reap "$pid"; fail "the second quiet hash took the ordinary non-terminal absorb instead of the terminal-stale override: $(cat "$triage")"; }
   reap "$pid"
   unset FM_FAKE_CREW_STATE
   pass "an answered needs-decision with a resumed run is absorbed on every distinct quiet hash, never re-surfaced"
