@@ -84,7 +84,13 @@ The structural multi-row composer reader, Kimi pointer-delivery path, Claude ren
 tests/fm-composer-ghost.test.sh
 tests/fm-kimi-harness.test.sh
 tests/fm-tmux-submit-busy.test.sh
+tests/fm-busy-selfcheck.test.sh
 ```
+
+The Claude busy-footer signature was reverified live on 2026-08-16 against Claude Code 2.1.233: six genuinely-working panes in the running fleet, covering the streaming shape (`✻ Whirring… (37m 35s · ↓ 64.6k tokens)`) and the tool-wait shape (`✻ Sautéed for 1m 8s · 1 monitor still running`), all classified busy by `fm_pane_is_busy <pane> claude`, and none classified busy by the shared no-harness default (harness scoping intact).
+A freshly launched idle 2.1.233 composer (no prompt submitted) classified not-busy under both the claude scope and the shared default, and the recorded idle `/clear` composer hint (`❯ new task? /clear to save 194.6k tokens`, live capture 2026-08-05) structurally cannot match because the signature requires a parenthesized duration footer or a count-and-nouns wait hint.
+The exact command was `. bin/fm-tmux-lib.sh; fm_pane_is_busy <session:window.pane> claude` per pane over a read-only `tmux capture-pane`.
+The rendered scan window is 12 non-blank lines (`fm_busy_tail_window_match`), because a queued-messages composer pushes the busy footer 7-9 non-blank rows above the bottom (measured 2026-08-05); the window and the idle `/clear` composer-hint non-match are pinned by the tests above, and `bin/fm-busy-selfcheck.sh` re-asserts the recorded fixture matrix at every session start (`BUSY_SIGNATURE:` diagnostic on drift).
 
 Expected structural matrix: real text on any content row is pending; all-empty complete boxes are empty; unreadable, incomplete, or unsafe boxes are unknown; and non-bordered panes retain cursor-row compatibility.
 Expected submit matrix: proven pending plus a matching busy footer is accepted as queued only for an opted-in harness; an idle, unknown, or non-opted-in harness remains pending; ambiguous pending is never converted; and only a proven empty composer succeeds directly.

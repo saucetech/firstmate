@@ -946,11 +946,13 @@ EOF
     ewf="$STATE/.wedge-escalations-$key"
     pf="$STATE/.paused-$key"   # flag: this key's stale is using the bounded pause cadence
     prev=$(cat "$hf" 2>/dev/null || true)
-    # Busy match: a backend's native semantic state when available (herdr), else
-    # the last 6 non-blank lines only (the TUI footer area, where every verified
-    # harness renders its busy indicator) so busy-looking strings in displayed
-    # content cannot suppress stale detection. Read once per window per poll and
-    # reused below so a busy verdict is consistent within one cycle.
+    # Busy match: the semantic busy-state contract (bin/fm-busy-lib.sh) via
+    # window_is_busy - the task's semantic record for converted harnesses, a
+    # backend's native state when available (herdr), and the Grok-only
+    # rendered-tail fallback scanning the bounded footer window so busy-looking
+    # strings in displayed content cannot suppress stale detection. Read once
+    # per window per poll and reused below so a busy verdict is consistent
+    # within one cycle.
     if window_is_busy "$w" "$tail40"; then busy_now=0; else busy_now=1; fi
     if [ "$h" = "$prev" ]; then
       n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
