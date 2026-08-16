@@ -26,7 +26,7 @@
 #                          both surfaced at once. A provably-working stale past the
 #                          wedge threshold also surfaces, with an "escalation N"
 #                          count in the reason, on the slow WORKING_STALE_ESCALATE_SECS
-#                          pace with per-repeat doubling capped at BUSY_TURN_MAX_SECS
+#                          pace with per-repeat doubling bounded by BUSY_TURN_MAX_SECS
 #                          (a provably-working pane is the benign case, so repeats
 #                          back off instead of re-waking every few minutes);
 #                          at FM_WEDGE_DEMAND_INSPECT_COUNT
@@ -149,9 +149,15 @@ STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}
 # wake every ~240s - a continuous token cost with no action to take, twice
 # flagged by the captain. A provably-working pane is the benign case, so the
 # first escalation waits this long and wedge_timer_check doubles the wait on
-# each repeat for the same unbroken condition, capped at BUSY_TURN_MAX_SECS,
-# which stays the hard first-escalation ceiling for a busy pane with no
-# completed turn. Panes that are NOT provably working never enter this pace:
+# each repeat for the same unbroken condition, capped at BUSY_TURN_MAX_SECS.
+# The cap bounds the per-repeat backoff GROWTH only; it is not a ceiling on
+# when anything first surfaces. At the shipped defaults a provably-working
+# stale first escalates 1500s after its wedge timer starts, and reaches
+# demand-deep-inspection (the third consecutive escalation, each timed from a
+# reset timer) after 1500+3000+3600 = 8100s of unbroken condition; a busy pane
+# with no completed turn starts that timer only once busy_turn_over_age crosses
+# BUSY_TURN_MAX_SECS, so it first surfaces at 3600+1500 = 5100s.
+# Panes that are NOT provably working never enter this pace:
 # they surface immediately, exactly as before. An explicit
 # FM_STALE_ESCALATE_SECS keeps binding this pace so existing overrides and
 # the documented bound stay honest.
@@ -292,7 +298,10 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 # escalation waits WORKING_STALE_ESCALATE_SECS, and every repeat for the same
 # unbroken condition doubles the wait, capped at BUSY_TURN_MAX_SECS, because
 # every caller has positive evidence the crew is working and a repeat wake
-# adds no new information. The escalation counter resets wherever the pane's
+# adds no new information. Each escalation clears the since-file, so the next
+# poll restarts the timer and the waits are cumulative rather than measured
+# from one fixed start; the cap therefore bounds backoff GROWTH only and is
+# not a ceiling on total time to surface. The escalation counter resets wherever the pane's
 # state resets to genuinely active, so a NEW quiet spell starts back at the
 # base pace. Never re-reads the crew state (the costly check already ran
 # once, at classification time). Shared by both places a hash can be absorbed
