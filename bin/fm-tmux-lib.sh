@@ -390,13 +390,25 @@ fm_pane_input_pending() {  # <target>
   [ "$(fm_tmux_composer_state "$1")" != empty ]
 }
 
+# fm_busy_tail_window_match: the ONE owner of the rendered busy-footer scan
+# window. Consumes a captured pane tail on stdin and matches the harness
+# signature against the last 12 non-blank lines. 12, not fewer: a Claude pane
+# whose composer holds queued messages renders the composer box, the
+# "Press up to edit queued messages" hint, tip rows, and the status bar BELOW
+# the busy footer, pushing it 7-9 non-blank rows above the bottom, so a 6-line
+# window read a provably-busy pane as idle (measured 2026-08-05). Shared by
+# the submit acknowledgement, the away-mode supervisor busy guard, and the
+# secondmate pending-reply observation so their windows cannot drift.
+fm_busy_tail_window_match() {  # [harness]
+  grep -v '^[[:space:]]*$' | tail -12 | fm_busy_lines_match "${1:-}"
+}
+
 # fm_pane_is_busy: 0 if the pane's last few non-blank lines show a busy footer
 # (an agent mid-turn). Scans a 40-line tail like fm-watch.sh.
 fm_pane_is_busy() {  # <target> [harness]
   local win=$1 harness=${2:-} tail40
   tail40=$(tmux capture-pane -p -t "$win" -S -40 2>/dev/null) || return 1
-  printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -12 \
-    | fm_busy_lines_match "$harness"
+  printf '%s' "$tail40" | fm_busy_tail_window_match "$harness"
 }
 
 fm_tmux_harness_supports_busy_queued_enter() {  # <harness>

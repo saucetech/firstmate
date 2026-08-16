@@ -179,6 +179,9 @@ The shared symptom is a healthy-looking pane with no work in progress, so each a
 | Interrupt | single Escape |
 | Skill invocation | `/<skill>` (e.g. `/no-mistakes`) |
 
+The busy-state hooks above are the only recorded worker-state source; the delivery-only rendered busy-footer signature (submit acknowledgement, away-mode busy guard, secondmate pending-reply observation) is owned by `bin/fm-tmux-lib.sh` and guarded against silent drift by the startup fixture self-check `bin/fm-busy-selfcheck.sh` (`BUSY_SIGNATURE:` diagnostic).
+Claude's rendered footer drifted once (2026-08-04) without any assertion noticing; if that diagnostic fires for claude, re-verify the live footer shapes before trusting send confirmations.
+
 First launch in a fresh worktree, or first ever on a machine, may show a trust or bypass-permissions confirmation.
 After every spawn, peek the pane within about 20 seconds.
 If such a dialog is showing, accept it from an active firstmate session using `FM_HOME=<this-firstmate-home> bin/fm-send.sh <window> --key Enter`, or the choice the dialog requires, unless `FM_HOME` is already set to the active firstmate home; verify the brief started processing.

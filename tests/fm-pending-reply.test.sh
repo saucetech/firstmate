@@ -742,6 +742,34 @@ test_kimi_capture_fallback_uses_recorded_harness() (
   pass "pending replies scope Kimi capture fallback by recorded harness"
 )
 
+test_capture_fallback_window_covers_queued_composer() (
+  # A busy Claude secondmate whose composer holds queued messages renders the
+  # composer box, queued hint, tip, and status rows BELOW the busy footer,
+  # pushing it 7-9 non-blank rows above the bottom of the capture (measured
+  # live 2026-08-05). The observation window must still see the footer, or a
+  # provably-busy secondmate reads fallback-idle and triggers a false recovery.
+  fm_backend_busy_state() { printf 'unknown'; }
+  fm_backend_capture() {
+    cat <<'PANE'
+✻ Cooked for 16s · 1 shell still running
+
+╭──────────────────────────────────────────╮
+│ > next steps after the current build     │
+╰──────────────────────────────────────────╯
+  Press up to edit queued messages
+  ⎿  Tip: Use /clear to start fresh when switching topics
+────────────────────────────────
+❯
+────────────────────────────────
+  ⬆ /gsd:update │ Fable 5 │ savour ██░░░░░░░░ 29%
+  ⏵⏵ bypass permissions on · 1 shell · ← 1 agent
+PANE
+  }
+  [ "$(fm_pending_reply_backend_observation tmux session:fm-hibit fm-hibit claude)" = busy ] \
+    || fail "busy footer behind a queued-messages composer must observe busy"
+  pass "pending replies observe a busy footer behind a queued-messages composer"
+)
+
 test_tick_skips_terminal_and_reuses_target_observation() {
   (
     local home state open1 open2 resolved escalated rec probe_log probes scan_log scans snapshot
@@ -926,6 +954,7 @@ test_helper_report_resolves
 test_busy_idle_observation_via_backend_abstraction
 test_unknown_backend_state_uses_capture_fallback
 test_kimi_capture_fallback_uses_recorded_harness
+test_capture_fallback_window_covers_queued_composer
 test_tick_skips_terminal_and_reuses_target_observation
 test_correlations_reuse_only_for_matching_open_task
 test_tick_end_to_end_missed_then_escalate

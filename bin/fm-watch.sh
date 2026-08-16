@@ -25,7 +25,11 @@
 #                          terminal (captain-relevant) or non-terminal (no verb),
 #                          both surfaced at once. A provably-working stale past the
 #                          wedge threshold also surfaces, with an "escalation N"
-#                          count in the reason; at FM_WEDGE_DEMAND_INSPECT_COUNT
+#                          count in the reason, on the slow WORKING_STALE_ESCALATE_SECS
+#                          pace with per-repeat doubling bounded by BUSY_TURN_MAX_SECS
+#                          (a provably-working pane is the benign case, so repeats
+#                          back off instead of re-waking every few minutes);
+#                          at FM_WEDGE_DEMAND_INSPECT_COUNT
 #                          consecutive escalations on the SAME pane, the reason
 #                          also carries a "demand-deep-inspection" marker so the
 #                          wake payload itself, not just repetition, forces a
@@ -137,15 +141,35 @@ SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trai
 # (fm-classify-lib.sh) backs the away-mode daemon; while state/.afk exists the
 # daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
 # wake) and never double-triages - and never runs the costly provably-working read.
-STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provably-working stale escalates as a possible wedge
+# Pause-recheck throttle, and the compatibility floor for the wedge pace below.
+STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}
+# Wedge-escalation pace for a PROVABLY-WORKING pane (an actively-running
+# pipeline step, or a busy pane past BUSY_TURN_MAX_SECS). Measured 2026-08-16:
+# six busy claude crews in 30-60min validation rounds each generated a wedge
+# wake every ~240s - a continuous token cost with no action to take, twice
+# flagged by the captain. A provably-working pane is the benign case, so the
+# first escalation waits this long and wedge_timer_check doubles the wait on
+# each repeat for the same unbroken condition, capped at BUSY_TURN_MAX_SECS.
+# The cap bounds the per-repeat backoff GROWTH only; it is not a ceiling on
+# when anything first surfaces. At the shipped defaults a provably-working
+# stale first escalates 1500s after its wedge timer starts, and reaches
+# demand-deep-inspection (the third consecutive escalation, each timed from a
+# reset timer) after 1500+3000+3600 = 8100s of unbroken condition; a busy pane
+# with no completed turn starts that timer only once busy_turn_over_age crosses
+# BUSY_TURN_MAX_SECS, so it first surfaces at 3600+1500 = 5100s.
+# Panes that are NOT provably working never enter this pace:
+# they surface immediately, exactly as before. An explicit
+# FM_STALE_ESCALATE_SECS keeps binding this pace so existing overrides and
+# the documented bound stay honest.
+WORKING_STALE_ESCALATE_SECS=${FM_WORKING_STALE_ESCALATE_SECS:-${FM_STALE_ESCALATE_SECS:-1500}}
 # A busy pane is unconditional proof of liveness with no built-in duration bound,
 # so a hung foreground call can remain hidden even while its rendered busy
 # footer changes every poll. BUSY_TURN_MAX_SECS bounds how long any busy pane
 # may go with no completed turn: once its task's
 # state/<id>.turn-ended marker (or, before any turn has completed, the task's
 # spawn record) is this old, busy_turn_over_age routes the pane through the
-# same STALE_ESCALATE_SECS-paced wedge_timer_check used for a provably-working
-# non-busy stale, so it escalates via the existing stale reason, escalation
+# same WORKING_STALE_ESCALATE_SECS-paced wedge_timer_check used for a
+# provably-working non-busy stale, so it escalates via the existing stale reason, escalation
 # counter, and demand-deep-inspection marker for human inspection only - never
 # an automatic interrupt, signal, or restart. A completed turn touches
 # turn-ended and resets the age. Set generously above any legitimate interval
@@ -270,13 +294,22 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 # Repeat-poll wedge-timer bookkeeping for an already-classified stale hash
 # absorbed as provably-working - repairs a missing/corrupt timer (self-heals a
 # watcher restart between recording the hash and recording the timer), or
-# escalates once STALE_ESCALATE_SECS have elapsed. Never re-reads the crew
-# state (the costly check already ran once, at classification time). Shared by
-# both places a hash can be absorbed this way: the plain non-terminal path,
-# and the stale_is_terminal-overridden path (a captain-relevant status-log
-# line that an active run/busy pane outranked).
+# escalates once the current backoff interval has elapsed: the first
+# escalation waits WORKING_STALE_ESCALATE_SECS, and every repeat for the same
+# unbroken condition doubles the wait, capped at BUSY_TURN_MAX_SECS, because
+# every caller has positive evidence the crew is working and a repeat wake
+# adds no new information. Each escalation clears the since-file, so the next
+# poll restarts the timer and the waits are cumulative rather than measured
+# from one fixed start; the cap therefore bounds backoff GROWTH only and is
+# not a ceiling on total time to surface. The escalation counter resets wherever the pane's
+# state resets to genuinely active, so a NEW quiet spell starts back at the
+# base pace. Never re-reads the crew state (the costly check already ran
+# once, at classification time). Shared by both places a hash can be absorbed
+# this way: the plain non-terminal path, and the stale_is_terminal-overridden
+# path (a captain-relevant status-log line that an active run/busy pane
+# outranked).
 wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n required i reason
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -285,8 +318,20 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
       ;;
     *)
       age=$(( $(date +%s) - since ))
-      if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
-        n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
+      n=$(cat "$escalation_file" 2>/dev/null || echo 0)
+      case "$n" in ''|*[!0-9]*) n=0 ;; esac
+      # The cap bounds the backoff GROWTH only; it never undercuts the base
+      # pace, so a small BUSY_TURN_MAX_SECS cannot make escalations fire
+      # faster than the configured pace.
+      required=$WORKING_STALE_ESCALATE_SECS
+      i=0
+      while [ "$i" -lt "$n" ] && [ "$required" -lt "$BUSY_TURN_MAX_SECS" ]; do
+        required=$(( required * 2 ))
+        [ "$required" -le "$BUSY_TURN_MAX_SECS" ] || required=$BUSY_TURN_MAX_SECS
+        i=$(( i + 1 ))
+      done
+      if [ "$age" -ge "$required" ]; then
+        n=$(( n + 1 ))
         echo "$n" > "$escalation_file"
         reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
         if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
@@ -946,11 +991,13 @@ EOF
     ewf="$STATE/.wedge-escalations-$key"
     pf="$STATE/.paused-$key"   # flag: this key's stale is using the bounded pause cadence
     prev=$(cat "$hf" 2>/dev/null || true)
-    # Busy match: a backend's native semantic state when available (herdr), else
-    # the last 6 non-blank lines only (the TUI footer area, where every verified
-    # harness renders its busy indicator) so busy-looking strings in displayed
-    # content cannot suppress stale detection. Read once per window per poll and
-    # reused below so a busy verdict is consistent within one cycle.
+    # Busy match: the semantic busy-state contract (bin/fm-busy-lib.sh) via
+    # window_is_busy - the task's semantic record for converted harnesses, a
+    # backend's native state when available (herdr), and the Grok-only
+    # rendered-tail fallback scanning the bounded footer window so busy-looking
+    # strings in displayed content cannot suppress stale detection. Read once
+    # per window per poll and reused below so a busy verdict is consistent
+    # within one cycle.
     if window_is_busy "$w" "$tail40"; then busy_now=0; else busy_now=1; fi
     if [ "$h" = "$prev" ]; then
       n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
@@ -1013,7 +1060,7 @@ EOF
           # on first sight, never every poll) via pause_state_class, which returns:
           #   - working: an actively-running pipeline legitimately sits on a static
           #     pane (e.g. waiting on CI), so absorb and start the wedge timer so a
-          #     genuinely frozen run still escalates past STALE_ESCALATE_SECS;
+          #     genuinely frozen run still escalates past WORKING_STALE_ESCALATE_SECS;
           #   - paused: the crew declared an external wait, or a declared pause or
           #     captain hold is paired with a confidently dead agent, so absorb on
           #     the long PAUSE_RESURFACE_SECS cadence instead of wedge-escalating;

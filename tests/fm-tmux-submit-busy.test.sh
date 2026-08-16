@@ -342,6 +342,67 @@ test_claude_busy_shapes_cover_every_live_form() {
   pass "fm_pane_is_busy: Claude busy shapes match without the timer false-positive"
 }
 
+# The busy footer is not always the last rendered row: a composer holding
+# queued messages renders the composer box, the "Press up to edit queued
+# messages" hint, tip rows, and the status bar BELOW the footer, pushing it
+# 7-9 non-blank rows above the bottom (measured live 2026-08-05). The scan
+# window must still see it, and the idle rows that sit at the very bottom -
+# including the /clear composer hint, whose token count once false-matched a
+# proposed bare token-count signature - must never classify busy on their own.
+test_claude_busy_window_covers_queued_composer() {
+  local dir fakebin composer
+  dir="$TMP_ROOT/claude-window"
+  fakebin=$(make_submit_mock "$dir")
+  composer="$dir/composer"
+  pane_busy() {
+    PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$composer" \
+      bash -c '. "$1/bin/fm-tmux-lib.sh"; fm_pane_is_busy "$2" "$3"' \
+      _ "$ROOT" "$1" "${2:-}"
+  }
+
+  # Genuinely busy (1 shell running) behind a queued-messages composer: the
+  # footer sits 9 non-blank rows above the bottom of the capture.
+  cat > "$composer" <<'PANE'
+✻ Cooked for 16s · 1 shell still running
+
+╭──────────────────────────────────────────╮
+│ > next steps after the current build     │
+╰──────────────────────────────────────────╯
+  Press up to edit queued messages
+  ⎿  Tip: Use /clear to start fresh when switching topics
+────────────────────────────────
+❯
+────────────────────────────────
+  ⬆ /gsd:update │ Fable 5 │ savour ██░░░░░░░░ 29%
+  ⏵⏵ bypass permissions on · 1 shell · ← 1 agent
+PANE
+  pane_busy queued claude || fail "busy footer behind a queued-messages composer must read busy"
+
+  # The same trailing rows WITHOUT a busy footer are an idle pane.
+  cat > "$composer" <<'PANE'
+✻ Worked for 31s
+
+────────────────────────────────
+❯ new task? /clear to save 194.6k tokens
+────────────────────────────────
+  ⬆ /gsd:update │ Fable 5 │ savour ██░░░░░░░░ 29%
+  ⏵⏵ bypass permissions on · ← 1 agent
+PANE
+  pane_busy idle-composer claude && fail "idle composer with the /clear token hint must stay idle"
+
+  # The /clear hint's token count alone must never satisfy the signature,
+  # for the claude scope or the shared no-harness default.
+  printf '❯ new task? /clear to save 194.6k tokens\n' > "$composer"
+  pane_busy clear-hint claude && fail "/clear composer hint must stay idle for claude"
+  pane_busy clear-hint && fail "/clear composer hint must stay idle for the shared default"
+
+  # The status bar's tool count renders on idle panes too.
+  printf '  ⏵⏵ bypass permissions on · 1 shell · ← 1 agent\n' > "$composer"
+  pane_busy status-bar claude && fail "status-bar tool count must stay idle"
+
+  pass "fm_pane_is_busy: window covers queued-composer depth without idle-hint false positives"
+}
+
 test_submit_fallback_respects_harness_capability() {
   local root
   root="$TMP_ROOT/submit-capability"
@@ -394,4 +455,5 @@ test_busy_pane_ambiguous_pending_retries_without_conversion
 test_unrecognized_state_skips_busy_conversion
 test_claude_busy_signature_uses_real_capture_shapes
 test_claude_busy_shapes_cover_every_live_form
+test_claude_busy_window_covers_queued_composer
 test_submit_fallback_respects_harness_capability

@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, STARTUP_MEMORY_BUDGET, CREW_DISPATCH invalid, FLEET_SYNC, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
+  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, STARTUP_MEMORY_BUDGET, CREW_DISPATCH invalid, BUSY_SIGNATURE, FLEET_SYNC, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
   A silent bootstrap section, or a BOOTSTRAP_INFO fact, means no skill load.
 user-invocable: false
 metadata:
@@ -29,6 +29,13 @@ When any diagnostic needs captain attention, report the plain consequence and re
   This is the only sanctioned firstmate-initiated git write to the primary, and it is a non-destructive branch switch that strands nothing.
 - `STARTUP_MEMORY_BUDGET: invalid config/startup-memory-budget - <reason>` - the visible startup-memory budget is not a safe one-line positive decimal file; do not infer the default or propagate it. Correct the local primary file, then rerun session start so the normal convergence path can deliver the validated value to secondmate homes.
 - `CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>` - the optional dispatch profile file exists but failed low-cost bootstrap validation; stop profile-based dispatch, report the actionable error, and require correction of the malformed schema, unverified harness name, or invalid harness/effort pair rather than falling back around it or selecting a bad profile.
+- `BUSY_SIGNATURE: <harness> <source>: <detail>` - the startup fixture self-check (`bin/fm-busy-selfcheck.sh`) found that a recorded busy or idle pane shape no longer classifies correctly, and `<source>` names which signature failed.
+  A dead busy match makes delivery guards read a working pane as idle; a false-BUSY can convert a swallowed message into a claimed delivery.
+  `shipped signature:` means the harness's rendered footer has drifted from the signature in `bin/fm-tmux-lib.sh`: capture a live busy and idle pane for that harness, verify the drift empirically, and ship a corrected signature plus updated fixtures rather than working around the check.
+  `FM_BUSY_REGEX override:` means this session's operator override is itself the fault - it matches a recorded idle shape, matches no recorded busy footer at all, or is not a valid extended regular expression - and carries the harness field `all` because that override is global.
+  Read the printed line before acting: it distinguishes a dead or invalid pattern from a deliberate stopgap aimed at a footer shape no fixture records yet, and clearing the override is the right move only for the former.
+  A narrow one-harness stopgap raises nothing while it matches that harness's recorded busy footers, but it still trips this check if it targets a new drifted shape or if it matches a recorded idle shape, so the durable fix is to record the live shape as a fixture and ship the corrected signature in `bin/fm-tmux-lib.sh`, then clear `FM_BUSY_REGEX` and rerun `bin/fm-busy-selfcheck.sh`.
+  Until it is fixed, treat that harness's send confirmations and away-mode busy guard as degraded.
 - `FLEET_SYNC: <repo>: skipped: <reason>` - a benign one-off skip (offline, no origin, local-only); bootstrap continued, investigate only if it blocks work.
   A skip can also report the bounded fleet-refresh timeout (`FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT`, or a fleet-size-aware default with a 20 second floor); a timeout never blocks startup.
 - `FLEET_SYNC: <repo>: recovered: <detail>` - the clone had drifted onto a clean detached HEAD holding no unique commits and the sync self-healed it (re-attached the default branch and fast-forwarded); no action needed, it is reported only so the self-heal is visible.
