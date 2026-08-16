@@ -1261,10 +1261,12 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
 
   n=1
   while [ "$n" -le 3 ]; do
-    # Backdate the wedge timer past the threshold before each round, mirroring
-    # the existing wedge-escalation tests' Phase B (the subsequent-sight timer
-    # path does not re-read the crew state).
-    echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+    # Backdate the wedge timer past the current backoff requirement before each
+    # round, mirroring the existing wedge-escalation tests' Phase B (the
+    # subsequent-sight timer path does not re-read the crew state). Repeat
+    # escalations for the same unbroken condition double the required wait, so
+    # round n needs pace * 2^(n-1).
+    echo $(( $(date +%s) - (240 * (1 << (n - 1)) + 60) )) > "$state/.stale-since-$key"
     : > "$out"
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
       FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
@@ -1315,6 +1317,93 @@ test_wedge_escalation_resets_when_pane_becomes_active() {
   reap "$pid"
   unset FM_FAKE_CREW_STATE
   pass "a pane becoming active again resets the consecutive wedge-escalation counter"
+}
+
+# --- provably-working escalation pace: raised default plus repeat backoff ----
+# Measured 2026-08-16: six busy claude crews in 30-60min validation rounds each
+# generated a wedge wake every ~240s - a continuous token cost with no action
+# to take. A provably-working pane's first escalation now waits the raised
+# WORKING_STALE_ESCALATE_SECS default, and each repeat for the same unbroken
+# condition doubles the wait (capped at BUSY_TURN_MAX_SECS). Panes that are not
+# provably working still surface immediately, and captain-relevant verbs are
+# always actionable, so the slower pace can only delay a repeat wedge PING for
+# a crew the watcher has positive evidence is working.
+test_working_stale_escalation_default_and_backoff() {
+  local dir state fakebin out capture_file window key pane_hash sig pid polls
+
+  absorb_round() {  # <label> - watcher must absorb (stay live, no wake)
+    : > "$out"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    # Wait until at least two further polls completed (the count file advances
+    # once per poll on an unchanged hash), so the absorb verdict is proven
+    # rather than raced.
+    polls=0
+    while [ "$polls" -lt 200 ]; do
+      [ "$(cat "$state/.count-$key" 2>/dev/null || echo 0)" -ge 4 ] && break
+      is_live_non_zombie "$pid" || break
+      polls=$((polls + 1))
+      sleep 0.1
+    done
+    if ! is_live_non_zombie "$pid"; then
+      reap "$pid"; fail "$1: watcher escalated instead of absorbing: $(cat "$out")"
+    fi
+    [ ! -s "$out" ] || { reap "$pid"; fail "$1: absorb printed a wake reason: $(cat "$out")"; }
+    [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "$1: absorb enqueued a wake"; }
+    reap "$pid"
+  }
+
+  escalate_round() {  # <label> <expected-count>
+    : > "$out"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    wait_for_exit "$pid" 40 || fail "$1: watcher did not escalate: $(cat "$out")"
+    grep -F "possible wedge, escalation $2" "$out" >/dev/null \
+      || fail "$1: expected escalation $2: $(cat "$out")"
+    : > "$state/.wake-queue"
+  }
+
+  dir=$(make_case working-stale-backoff); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-backoff"
+  printf 'no-mistakes axi run: validating...' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/backoff.meta"
+  printf 'working: long validation round\n' > "$state/backoff.status"
+  sig=$(seen_sig "$state/backoff.status"); printf '%s' "$sig" > "$state/.seen-backoff_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "no-mistakes axi run: validating...")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  # Default floor: no pace override anywhere in this env. 600s of idle is past
+  # the retired 240s default but must be absorbed - bracketing the raised
+  # default from below without waiting the literal interval.
+  echo $(( $(date +%s) - 600 )) > "$state/.stale-since-$key"
+  absorb_round "default floor (600s idle)"
+
+  # Default fires: 1600s of idle is past the 1500s default.
+  echo $(( $(date +%s) - 1600 )) > "$state/.stale-since-$key"
+  escalate_round "default pace (1600s idle)" 1
+
+  # Repeat backoff: after one escalation the same interval is no longer
+  # enough (the second escalation needs 3000s).
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  printf '1\n' > "$state/.count-$key"
+  echo $(( $(date +%s) - 1600 )) > "$state/.stale-since-$key"
+  absorb_round "repeat backoff (1600s idle after escalation 1)"
+
+  # Past the doubled interval the repeat escalates with the next count.
+  echo $(( $(date +%s) - 3100 )) > "$state/.stale-since-$key"
+  escalate_round "doubled repeat pace (3100s idle)" 2
+
+  unset FM_FAKE_CREW_STATE
+  pass "provably-working stale escalations use the raised default and back off on repeats"
 }
 
 # --- busy pane duration bound: a completed-turn age gate on top of busy -----
@@ -2048,6 +2137,7 @@ test_stale_needs_decision_without_active_run_still_surfaces
 test_nonterminal_stale_provably_working_absorbed_then_escalated
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold
 test_wedge_escalation_resets_when_pane_becomes_active
+test_working_stale_escalation_default_and_backoff
 test_busy_pane_below_turn_age_bound_is_absorbed
 test_busy_pane_stable_hash_escalates_past_turn_age_bound
 test_busy_pane_changing_hash_escalates_past_turn_age_bound
