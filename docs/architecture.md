@@ -106,6 +106,7 @@ Endpoint death is the only process-level override and yields dead; child process
 Each record is bound to an incarnation token minted when the task's wiring is armed, so an event from a superseded incarnation is rejected rather than applied, and a record left behind by one classifies unknown.
 Three rendered-text readers deliberately remain outside this contract because they answer delivery questions: the submit acknowledgement and away-mode supervisor-pane busy guard in `bin/fm-tmux-lib.sh`, and the secondmate delivery-confirmation observation in `bin/fm-pending-reply-lib.sh`.
 All are harness-scoped rather than a global pattern union, and none is a recorded worker state source.
+All three share one scan-window owner, `fm_busy_tail_window_match` in `bin/fm-tmux-lib.sh`, so their windows cannot drift apart, and `bin/fm-busy-selfcheck.sh` re-asserts the recorded busy and idle fixtures at every session start so a drifted signature raises a `BUSY_SIGNATURE:` bootstrap diagnostic instead of degrading the delivery guards silently.
 
 ## Runtime session backends
 
