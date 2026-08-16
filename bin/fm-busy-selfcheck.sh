@@ -25,7 +25,10 @@
 #     reads not-busy while grep's stderr leaks into the session digest);
 #   - it must match at least ONE recorded busy footer across all harnesses, so
 #     a typo'd or stale pattern that matches nothing is caught while a narrow
-#     one-harness stopgap - which matches that harness's fixtures - is not;
+#     one-harness stopgap that matches that harness's recorded fixtures is not;
+#     a stopgap aimed at a NEW drifted shape no fixture records yet trips this
+#     too, which is why the printed line names both explanations and asks for
+#     the recorded fixture plus corrected signature rather than for a clear;
 #   - no recorded idle shape may match it, the dangerous false-BUSY direction,
 #     which applies fleet-wide whichever harness the operator targeted.
 # Per-harness busy fixtures are deliberately NOT reported against the override:
@@ -163,7 +166,7 @@ if [ -n "$BUSY_REGEX_OVERRIDE" ]; then
     FAILED=1
   else
     if [ "$OVERRIDE_BUSY_HITS" -eq 0 ]; then
-      printf 'BUSY_SIGNATURE: all FM_BUSY_REGEX override: matches no recorded busy footer - a dead override makes every working pane read idle and delivery guards degrade fleet-wide; fix or clear FM_BUSY_REGEX\n'
+      printf 'BUSY_SIGNATURE: all FM_BUSY_REGEX override: matches no recorded busy footer - either the pattern is dead (a typo or a stale copy, under which every working pane reads idle and delivery guards degrade fleet-wide), or it deliberately targets a NEW drifted footer shape these recorded fixtures cannot know yet; establish which live, then record the real shape as a fixture and ship the corrected signature in bin/fm-tmux-lib.sh before clearing FM_BUSY_REGEX\n'
       FAILED=1
     fi
     each_idle_fixture override_idle_fixture
