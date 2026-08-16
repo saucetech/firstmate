@@ -32,8 +32,8 @@ When any diagnostic needs captain attention, report the plain consequence and re
 - `BUSY_SIGNATURE: <harness> <source>: <detail>` - the startup fixture self-check (`bin/fm-busy-selfcheck.sh`) found that a recorded busy or idle pane shape no longer classifies correctly, and `<source>` names which signature failed.
   A dead busy match makes delivery guards read a working pane as idle; a false-BUSY can convert a swallowed message into a claimed delivery.
   `shipped signature:` means the harness's rendered footer has drifted from the signature in `bin/fm-tmux-lib.sh`: capture a live busy and idle pane for that harness, verify the drift empirically, and ship a corrected signature plus updated fixtures rather than working around the check.
-  `FM_BUSY_REGEX override:` means this session's operator override matches a recorded IDLE shape; because that override is global it makes every finished pane in the fleet read busy, so narrow or clear `FM_BUSY_REGEX` and rerun `bin/fm-busy-selfcheck.sh`.
-  The check deliberately never runs the busy fixtures against an override, so a narrow one-harness stopgap override is not itself a finding.
+  `FM_BUSY_REGEX override:` means this session's operator override is itself the fault - it matches a recorded idle shape, matches no recorded busy footer at all, or is not a valid extended regular expression - and carries the harness field `all` because that override is global.
+  Fix or clear `FM_BUSY_REGEX` and rerun `bin/fm-busy-selfcheck.sh`; an override only has to match one harness's recorded busy footers, so a narrow one-harness stopgap is never itself a finding.
   Until it is fixed, treat that harness's send confirmations and away-mode busy guard as degraded.
 - `FLEET_SYNC: <repo>: skipped: <reason>` - a benign one-off skip (offline, no origin, local-only); bootstrap continued, investigate only if it blocks work.
   A skip can also report the bounded fleet-refresh timeout (`FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT`, or a fleet-size-aware default with a 20 second floor); a timeout never blocks startup.

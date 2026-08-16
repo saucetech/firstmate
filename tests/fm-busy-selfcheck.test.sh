@@ -61,10 +61,11 @@ test_false_busy_shipped_signature_fails_loudly() {
 }
 
 # FM_BUSY_REGEX is global in fm_busy_lines_match but is used as a narrow,
-# one-harness stopgap while a drift is being fixed. Running the per-harness busy
-# fixtures against such an override would fail the untargeted harnesses by
+# one-harness stopgap while a drift is being fixed. Reporting the per-harness
+# busy fixtures against such an override would fail the untargeted harnesses by
 # construction and print a permanent false diagnostic on every bootstrap, so the
-# busy direction is checked against the shipped signatures only.
+# override's busy direction is a union check: matching one harness's recorded
+# busy footers is enough.
 test_narrow_override_raises_no_false_busy_alarm() {
   local out rc
   out=$(FM_BUSY_REGEX='esc to interrupt' "$ROOT/bin/fm-busy-selfcheck.sh" 2>&1)
@@ -76,7 +77,7 @@ test_narrow_override_raises_no_false_busy_alarm() {
 
 test_false_busy_override_fails_loudly() {
   local out rc
-  out=$(FM_BUSY_REGEX='Worked for [0-9]+s' "$ROOT/bin/fm-busy-selfcheck.sh" 2>&1)
+  out=$(FM_BUSY_REGEX='for [0-9]+s' "$ROOT/bin/fm-busy-selfcheck.sh" 2>&1)
   rc=$?
   [ "$rc" -ne 0 ] || fail "an override matching a recorded idle fixture must fail the self-check"
   assert_contains "$out" "BUSY_SIGNATURE: claude FM_BUSY_REGEX override: recorded idle shape matches as busy" \
@@ -87,11 +88,45 @@ test_false_busy_override_fails_loudly() {
   pass "fm-busy-selfcheck: a false-BUSY FM_BUSY_REGEX override fails loudly"
 }
 
+# A dead override is the original defect class this guard exists for: under it
+# every pane reads not-busy, so the away-mode supervisor busy guard can inject
+# into a working pane and the submit acknowledgement loses its busy-queued
+# conversion.
+test_dead_override_fails_loudly() {
+  local out rc
+  out=$(FM_BUSY_REGEX='will-never-match-any-footer' "$ROOT/bin/fm-busy-selfcheck.sh" 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "an override matching no recorded busy footer must fail the self-check"
+  assert_contains "$out" "BUSY_SIGNATURE: all FM_BUSY_REGEX override: matches no recorded busy footer" \
+    "a dead override must be named as the source, once, fleet-wide"
+  [ "$(grep -c 'FM_BUSY_REGEX override' <<<"$out")" -eq 1 ] \
+    || fail "a dead override must report once, not once per harness: $out"
+  pass "fm-busy-selfcheck: a dead FM_BUSY_REGEX override fails loudly"
+}
+
+# An invalid ERE makes grep exit 2, so every pane reads not-busy AND grep's
+# stderr would otherwise reach the session digest unprefixed (bootstrap runs the
+# self-check unredirected and fm-session-start.sh captures 2>&1).
+test_invalid_override_fails_loudly_without_grep_noise() {
+  local out rc
+  out=$(FM_BUSY_REGEX='esc to interrupt[' "$ROOT/bin/fm-busy-selfcheck.sh" 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "an override that is not a valid ERE must fail the self-check"
+  assert_contains "$out" "BUSY_SIGNATURE: all FM_BUSY_REGEX override: not a valid extended regular expression" \
+    "an invalid override must be reported as its own failure case"
+  case "$out" in
+    *grep:*) fail "raw grep stderr must not leak into the diagnostic output: $out" ;;
+  esac
+  [ "$(grep -c 'BUSY_SIGNATURE' <<<"$out")" -eq 1 ] \
+    || fail "an invalid override must report once, not per fixture: $out"
+  pass "fm-busy-selfcheck: an invalid FM_BUSY_REGEX override fails loudly with no grep noise"
+}
+
 test_bootstrap_surfaces_the_diagnostic() {
   local out home
   home="$TMP_ROOT/bootstrap-home"
   mkdir -p "$home"
-  out=$(FM_BUSY_REGEX='Worked for [0-9]+s' FM_BOOTSTRAP_DETECT_ONLY=1 \
+  out=$(FM_BUSY_REGEX='for [0-9]+s' FM_BOOTSTRAP_DETECT_ONLY=1 \
     FM_HOME="$home" FM_ROOT_OVERRIDE="$home" \
     "$ROOT/bin/fm-bootstrap.sh" 2>&1) || true
   assert_contains "$out" "BUSY_SIGNATURE:" \
@@ -104,4 +139,6 @@ test_dead_shipped_signature_fails_loudly
 test_false_busy_shipped_signature_fails_loudly
 test_narrow_override_raises_no_false_busy_alarm
 test_false_busy_override_fails_loudly
+test_dead_override_fails_loudly
+test_invalid_override_fails_loudly_without_grep_noise
 test_bootstrap_surfaces_the_diagnostic
