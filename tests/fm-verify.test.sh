@@ -1013,52 +1013,99 @@ test_build_descendants_are_drained_before_staging() {
   pass "fm-verify: build descendants are drained before artifact staging"
 }
 
-test_build_descendant_escaping_its_process_group_fails_closed() {
-  local BUILD_CMD helper escaped_pid_file escaped_pid
-  new_fixture escaped-build-descendant
-  helper="$FIX_TMP/escape-descendant.pl"
-  escaped_pid_file="$FIX_TMP/escaped.pid"
+test_build_descendant_left_alive_after_drain_fails_closed() {
+  local BUILD_CMD helper leak_pid_file leak_pid retained_pids worktree container
+  new_fixture leaked-build-descendant
+  helper="$FIX_TMP/leak-descendant.pl"
+  leak_pid_file="$FIX_TMP/leaked.pid"
+  # The leak the containment gate exists for: a process still running on the host
+  # after the build is over. The daemon detaches into its own process group and
+  # keeps the lineage descriptor, so the runner does observe that group. It then
+  # orphans a second process INTO the same group through a transient middle
+  # process, and that one closes every descriptor and moves its working directory
+  # outside the build root - so per-pid tracking, the lineage scan and the
+  # unaccounted-lineage scan all lose it. Its process group is the only remaining
+  # thread back to the build, and the drain cannot reach it.
   cat > "$helper" <<'PL'
 #!/usr/bin/env perl
 use POSIX qw(setsid);
-defined(my $first = fork) or die "first fork: $!";
-exit 0 if $first;
+defined(my $detached = fork) or die "detach fork: $!";
+exit 0 if $detached;
 setsid() or die "setsid: $!";
-defined(my $second = fork) or die "second fork: $!";
-exit 0 if $second;
-open STDIN, '<', '/dev/null' or die "stdin: $!";
-open STDOUT, '>', '/dev/null' or die "stdout: $!";
-open STDERR, '>', '/dev/null' or die "stderr: $!";
-open my $pid_file, '>', $ARGV[0] or die "pid file: $!";
-print {$pid_file} "$$\n";
-close $pid_file;
+defined(my $middle = fork) or die "middle fork: $!";
+if (!$middle) {
+  defined(my $leak = fork) or die "leak fork: $!";
+  exit 0 if $leak;
+  chdir '/' or die "chdir: $!";
+  open my $pid_file, '>', $ARGV[0] or die "pid file: $!";
+  print {$pid_file} "$$\n";
+  close $pid_file;
+  for my $fd (0 .. 255) { POSIX::close($fd); }
+  $SIG{TERM} = 'IGNORE';
+  sleep 1 while 1;
+}
+waitpid($middle, 0);
 $SIG{TERM} = 'IGNORE';
 sleep 1 while 1;
 PL
   chmod +x "$helper"
-  # The helper double-forks, so the detached grandchild is created asynchronously
-  # and may not exist yet when the build returns. Wait for it to publish its pid
-  # before exiting, or the post-build scan races it and the run refuses without
-  # naming that pid - an observed ~1-in-5 flake. This does NOT weaken the
-  # assertion: the descendant still detaches, still ignores TERM, and detection
-  # still has to find it uncooperatively. Do not delete this wait to "fix" a
-  # failure here - a flaky test in this suite is what previously invited a
-  # revert of the feature instead of a fix to the timing assumption.
-  BUILD_CMD="mkdir -p build; cp README.md build/app.txt; '$helper' '$escaped_pid_file'; while [ ! -s '$escaped_pid_file' ]; do sleep 0.05; done; exit 0"
+  # Wait for the leaked pid to be published before the build returns, for the same
+  # reason the sibling tests do: the process is created asynchronously and the
+  # post-build scan would otherwise race it. This does NOT weaken the assertion -
+  # the process still detaches, still ignores TERM, and detection still has to
+  # find it with nothing but its process group.
+  BUILD_CMD="mkdir -p build; cp README.md build/app.txt; '$helper' '$leak_pid_file' & while [ ! -s '$leak_pid_file' ]; do sleep 0.05; done; exit 0"
   run_verify demo-ship --promise "$PROMISE"
-  expect_code 1 "$VERIFY_RC" "an immediate double-forked descendant must fail closed (got: $VERIFY_OUT)"
-  [ -s "$escaped_pid_file" ] || fail "the escaped descendant did not publish its pid"
-  escaped_pid=$(cat "$escaped_pid_file")
-  assert_contains "$VERIFY_OUT" "escaped-descendants:$escaped_pid" \
-    "the orchestration error must identify the escaped descendant"
-  if kill -0 "$escaped_pid" 2>/dev/null; then
-    kill -KILL "$escaped_pid" 2>/dev/null || true
-    fail "the escaped build descendant remained alive"
-  fi
+  expect_code 1 "$VERIFY_RC" "a descendant left alive after the drain must fail closed (got: $VERIFY_OUT)"
+  [ -s "$leak_pid_file" ] || fail "the leaked descendant did not publish its pid"
+  leak_pid=$(cat "$leak_pid_file")
+  kill -0 "$leak_pid" 2>/dev/null || fail "the test did not actually leak a live process"
+  assert_contains "$VERIFY_OUT" "because build drain was not confirmed" \
+    "a live leaked descendant must be reported as an unconfirmed drain"
+  retained_pids=$(awk -F= '$1 == "build_cleanup_pids" { print $2 }' "$FIX_HOME/state/demo-ship-verify.verify")
+  assert_contains "$retained_pids" "$leak_pid" \
+    "the retained binding must name the process that is still running"
   assert_absent "$FIX_HOME/data/demo-ship-verify/report.md" \
-    "an escaped descendant must not become a product verdict"
-  [ ! -s "$FIX_SPAWN_LOG" ] || fail "an escaped descendant must stop artifact staging and spawn"
-  pass "fm-verify: immediate escaped build descendants fail closed"
+    "a leaked descendant must not become a product verdict"
+  [ ! -s "$FIX_SPAWN_LOG" ] || fail "a leaked descendant must stop artifact staging and spawn"
+  worktree=$(awk -F= '$1 == "build_cleanup_path" { print substr($0, index($0, "=") + 1) }' "$FIX_HOME/state/demo-ship-verify.verify")
+  container=$(awk -F= '$1 == "build_cleanup_container" { print substr($0, index($0, "=") + 1) }' "$FIX_HOME/state/demo-ship-verify.verify")
+  pkill -KILL -f "$helper" 2>/dev/null || true
+  kill -KILL "$leak_pid" 2>/dev/null || true
+  git -C "$FIX_PROJ" worktree remove --force "$worktree" >/dev/null 2>&1 || true
+  /bin/rm -rf "$container"
+  pass "fm-verify: descendants left alive after the drain fail closed"
+}
+
+test_cleanly_exited_own_process_group_children_are_not_a_leak() {
+  local BUILD_CMD helper
+  new_fixture clean-process-group-children
+  helper="$FIX_TMP/clean-process-groups.pl"
+  # The other direction, and the reason this gate was rewritten: a real toolchain
+  # runs plenty of work in process groups of its own and reaps all of it. Before
+  # the fix the runner remembered every such child forever and refused at the end
+  # on a set of processes that had already exited - on a real iOS build that was
+  # hundreds of them, none alive, which blocked every iOS verification in the
+  # fleet. Nothing here survives the build, so nothing here may fail it.
+  cat > "$helper" <<'PL'
+#!/usr/bin/env perl
+use POSIX qw(setsid);
+for my $round (1 .. 5) {
+  defined(my $child = fork) or die "fork: $!";
+  if (!$child) {
+    setsid() or die "setsid: $!";
+    select undef, undef, undef, 0.3;
+    exit 0;
+  }
+  waitpid($child, 0);
+}
+PL
+  chmod +x "$helper"
+  BUILD_CMD="mkdir -p build; cp README.md build/app.txt; '$helper'; exit 0"
+  run_verify demo-ship --promise "$PROMISE"
+  expect_code 0 "$VERIFY_RC" "cleanly exited own-process-group children must not fail the build (got: $VERIFY_OUT)"
+  [ -s "$FIX_SPAWN_LOG" ] || fail "the verification must reach the verifier spawn"
+  pass "fm-verify: cleanly exited own-process-group children are not a leak"
 }
 
 test_build_descendant_closing_lineage_fails_closed() {
@@ -1694,7 +1741,8 @@ test_permanently_unobservable_leader_still_refuses
 test_build_timeout_is_not_a_product_verdict
 test_build_cannot_forge_runner_status
 test_build_descendants_are_drained_before_staging
-test_build_descendant_escaping_its_process_group_fails_closed
+test_build_descendant_left_alive_after_drain_fails_closed
+test_cleanly_exited_own_process_group_children_are_not_a_leak
 test_build_descendant_closing_lineage_fails_closed
 test_worktree_allocation_failure_is_not_a_product_verdict
 test_unconfirmed_worktree_cleanup_fails_closed

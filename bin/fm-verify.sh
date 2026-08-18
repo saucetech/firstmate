@@ -461,7 +461,7 @@ runner_result_matches_exit() {
       case "$expected" in ''|*[!0-9]*) return 1 ;; esac
       expected=$((128 + expected))
       ;;
-    drained:timeout:*|drained:error:*|undrained:pids=*|undrained:lineage=*) expected=125 ;;
+    drained:timeout:*|drained:error:*|undrained:pids=*|undrained:lineage=*|undrained:escaped=*) expected=125 ;;
     *) return 1 ;;
   esac
   case "$expected" in ''|*[!0-9]*) return 1 ;; esac
@@ -472,6 +472,7 @@ runner_result_survivors() {
   case "$1" in
     undrained:pids=*) printf '%s\n' "${1#undrained:pids=}" ;;
     undrained:lineage=*) printf '%s\n' "${1#undrained:lineage=}" ;;
+    undrained:escaped=*) printf '%s\n' "${1#undrained:escaped=}" ;;
     *) printf '%s\n' unknown ;;
   esac
 }
@@ -862,7 +863,8 @@ run_build_with_timeout() {
     $lineage_scanned = 0;
     $lineage_scan_rounds = 0;
     %tracked_start = ();
-    %escaped_seen = ();
+    %escaped_start = ();
+    %escaped_groups = ();
     %baseline_start = ();
     $reap_leader = sub {
       return 1 if $leader_reaped;
@@ -964,7 +966,8 @@ run_build_with_timeout() {
             next unless exists($processes->{$lineage_pid});
             $tracked_start{$lineage_pid} = $processes->{$lineage_pid}->{start};
             if ($lineage_pid != $pid && $processes->{$lineage_pid}->{pgid} != $pid) {
-              $escaped_seen{$lineage_pid} = $processes->{$lineage_pid}->{start};
+              $escaped_start{$lineage_pid} = $processes->{$lineage_pid}->{start};
+              $escaped_groups{$processes->{$lineage_pid}->{pgid}} = 1;
             }
           }
         }
@@ -991,7 +994,8 @@ run_build_with_timeout() {
             $changed = 1;
           }
           if ($candidate != $pid && $entry->{pgid} != $pid) {
-            $escaped_seen{$candidate} = $entry->{start};
+            $escaped_start{$candidate} = $entry->{start};
+            $escaped_groups{$entry->{pgid}} = 1;
           }
         }
       }
@@ -1068,6 +1072,50 @@ run_build_with_timeout() {
       return (undef, "lsof-exit:$cwd_lsof_status") unless $cwd_lsof_status == 0 || $cwd_lsof_status == 1;
       @unaccounted = keys %unaccounted_pid;
       return (\@unaccounted, "");
+    };
+    # What containment actually owes the host: when the build is over, nothing it
+    # started may still be running. It does NOT owe the host a build whose
+    # toolchain never used a process group of its own - xcodebuild legitimately
+    # creates hundreds, and every one of them exits on its own.
+    #
+    # So an escape is a LEAD, not a verdict. Escaping the leader process group
+    # matters because kill on the leader group cannot reach that subtree, and a
+    # member of it that no snapshot ever caught is invisible to per-pid tracking
+    # too. Remembering which groups the build escaped into is what makes that
+    # subtree addressable at the end; the verdict itself is taken here, against
+    # a fresh snapshot, and only processes that are STILL ALIVE count.
+    #
+    # Both halves are load-bearing. The remembered-pid half catches an escape we
+    # tracked that outlived the drain. The group half catches the one per-pid
+    # tracking structurally cannot: a process whose ancestry back to the tracked
+    # set died before any snapshot saw it, so it is parented to init, and whose
+    # working directory is outside the build root, so the unaccounted-lineage
+    # scan does not claim it either. Its process group is the only thread back to
+    # the build, which is why the group is remembered rather than just counted.
+    #
+    # Do NOT restore the old test - refusing whenever %escaped_start is non-empty.
+    # It asserted history instead of liveness: it blocked every iOS verification
+    # in the fleet on hundreds of processes that had already exited, while a
+    # genuinely leaked process could still walk past it. Tests pin both directions.
+    $live_escaped_descendants = sub {
+      ($processes, $snapshot_error) = $snapshot->();
+      return (undef, $snapshot_error) unless defined($processes);
+      %live_escaped_pid = ();
+      for $candidate (keys %{$processes}) {
+        next if $candidate == $$ || $candidate == $pid;
+        $entry = $processes->{$candidate};
+        next unless $entry->{uid} == $runner_uid;
+        next if $entry->{state} =~ /^Z/;
+        if (exists($escaped_start{$candidate}) && $escaped_start{$candidate} eq $entry->{start}) {
+          $live_escaped_pid{$candidate} = 1;
+          next;
+        }
+        next unless exists($escaped_groups{$entry->{pgid}});
+        next if exists($baseline_start{$candidate}) && $baseline_start{$candidate} eq $entry->{start};
+        $live_escaped_pid{$candidate} = 1;
+      }
+      @live_escaped = keys %live_escaped_pid;
+      return (\@live_escaped, "");
     };
     $terminate_all = sub {
       ($live, $refresh_error) = $refresh_descendants->();
@@ -1211,9 +1259,13 @@ run_build_with_timeout() {
       $publish->("undrained:lineage=" . join(",", sort { $a <=> $b } @{$unaccounted})) or exit 125;
       exit 125;
     }
-    if (keys %escaped_seen) {
-      $escaped = join(",", sort { $a <=> $b } keys %escaped_seen);
-      $publish->("drained:error:escaped-descendants:$escaped") or exit 125;
+    ($live_escaped, $escaped_error) = $live_escaped_descendants->();
+    if (!defined($live_escaped)) {
+      $publish->("undrained:pids=$escaped_error") or exit 125;
+      exit 125;
+    }
+    if (@{$live_escaped}) {
+      $publish->("undrained:escaped=" . join(",", sort { $a <=> $b } @{$live_escaped})) or exit 125;
       exit 125;
     }
     $status = $leader_status;
