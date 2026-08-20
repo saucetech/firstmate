@@ -1114,7 +1114,9 @@ run_build_with_timeout() {
     # member of it that no snapshot ever caught is invisible to per-pid tracking
     # too. Remembering which groups the build escaped into is what makes that
     # subtree addressable at the end; the verdict itself is taken here, against
-    # a fresh snapshot, and only processes that are STILL ALIVE count.
+    # fresh snapshots, and only processes that are STILL ALIVE count. What this
+    # sub returns is a set of suspects from one such snapshot - a set becomes a
+    # refusal only after $settle_live_escaped re-polls it.
     #
     # Both halves are load-bearing. The remembered-pid half catches an escape we
     # tracked that outlived the drain. The group half catches the one per-pid
@@ -1154,6 +1156,41 @@ run_build_with_timeout() {
       }
       @live_escaped = keys %live_escaped_pid;
       return (\@live_escaped, "");
+    };
+    # A snapshot is a SAMPLE of the process table, so one of them cannot carry a
+    # verdict about liveness on its own - the same reason the readiness gate below
+    # re-observes, and the same reason the drain re-polls tracked pids on a graded
+    # budget before it calls any of them survivors. The first non-empty result
+    # here is therefore a set of SUSPECTS, not a leak: a toolchain helper whose
+    # ancestry back to the tracked set died between samples can be milliseconds
+    # from exiting when it is caught, and convicting it refuses a good
+    # verification, strands the build worktree, and sends whoever reads the
+    # refusal after a process that has already gone.
+    #
+    # So re-sample on the cadence $wait_all_gone uses, drop every suspect that
+    # exits during the window, and refuse only on what is still alive when the
+    # window closes. This costs a normal build nothing - it runs only once a
+    # suspect exists - and softens nothing: a genuinely leaked process is still
+    # running at the end of a window this short, which is what makes it a leak.
+    # A snapshot that cannot be taken stays an error, exactly as it is outside
+    # the window. Do not collapse this back to a single sample.
+    $settle_live_escaped = sub {
+      $settle_suspects = shift;
+      $settle_attempts = shift;
+      %settle_remaining = map { $_ => 1 } @{$settle_suspects};
+      for (1 .. $settle_attempts) {
+        select undef, undef, undef, 0.05;
+        ($settle_live, $settle_error) = $live_escaped_descendants->();
+        return (undef, $settle_error) unless defined($settle_live);
+        %settle_still_live = map { $_ => 1 } @{$settle_live};
+        for $settle_pid (keys %settle_remaining) {
+          delete $settle_remaining{$settle_pid} unless exists($settle_still_live{$settle_pid});
+        }
+        @settle_survivors = keys %settle_remaining;
+        return (\@settle_survivors, "") unless @settle_survivors;
+      }
+      @settle_survivors = keys %settle_remaining;
+      return (\@settle_survivors, "");
     };
     $terminate_all = sub {
       ($live, $refresh_error) = $refresh_descendants->();
@@ -1301,6 +1338,14 @@ run_build_with_timeout() {
     if (!defined($live_escaped)) {
       $publish->("undrained:pids=$escaped_error") or exit 125;
       exit 125;
+    }
+    if (@{$live_escaped}) {
+      # Same budget the drain gives tracked pids after TERM: 20 polls at 0.05s.
+      ($live_escaped, $escaped_error) = $settle_live_escaped->($live_escaped, 20);
+      if (!defined($live_escaped)) {
+        $publish->("undrained:pids=$escaped_error") or exit 125;
+        exit 125;
+      }
     }
     if (@{$live_escaped}) {
       $publish->("undrained:escaped=" . join(",", sort { $a <=> $b } @{$live_escaped})) or exit 125;
