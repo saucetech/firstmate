@@ -1237,12 +1237,15 @@ run_escaped_group_fixture() {
 }
 
 test_live_member_of_an_escaped_group_fails_closed() {
-  local retained_pids
+  local retained_pids drain_samples
   # The group half of the containment check, on the process it exists for: an
   # orphan the drain never tracked, still running in a group the build entered,
   # with that group still led by the same process. Binding the group to an
-  # identity must not cost the check this refusal.
+  # identity must not cost the check this refusal, and neither may re-polling
+  # it: this member is reported by every sample of the settle window, including
+  # the closing one, which is the whole definition of a leak.
   run_escaped_group_fixture escaped-group-still-ours "$ESCAPED_GROUP_OBSERVED_START"
+  drain_samples=$(wc -l < "$ESCAPED_GROUP_DRAIN_MARK")
   retained_pids=$(release_retained_build_state)
   expect_code 1 "$VERIFY_RC" \
     "a live member of an escaped group must fail closed (got: $VERIFY_OUT)"
@@ -1260,6 +1263,10 @@ test_live_member_of_an_escaped_group_fails_closed() {
     "the retained binding must name the surviving member of the escaped group"
   assert_absent "$FIX_HOME/data/demo-ship-verify/report.md" \
     "an unconfirmed drain must not become a product verdict"
+  # The refusal has to be the verdict of a closed window rather than of the one
+  # sample that opened it, or the re-poll is not doing the job it was added for.
+  [ "$drain_samples" -ge "$ESCAPED_GROUP_SETTLE_WINDOW" ] \
+    || fail "the refusal was taken before the settle window closed (drain samples: $drain_samples)"
   pass "fm-verify: live members of an escaped process group fail closed"
 }
 
@@ -1304,24 +1311,6 @@ test_escaped_group_member_that_exits_during_the_settle_is_not_a_leak() {
   pass "fm-verify: an escaped-group member that exits during the settle is not a leak"
 }
 
-test_escaped_group_member_alive_through_the_settle_still_fails_closed() {
-  local drain_samples retained_pids
-  # The other half of the same obligation: the window is a settle, not a reprieve.
-  # A process still running when it closes is exactly what a leak is, and
-  # re-polling must not talk the check out of saying so.
-  run_escaped_group_fixture escaped-group-member-survives "$ESCAPED_GROUP_OBSERVED_START"
-  drain_samples=$(wc -l < "$ESCAPED_GROUP_DRAIN_MARK")
-  retained_pids=$(release_retained_build_state)
-  expect_code 1 "$VERIFY_RC" \
-    "a member alive across the whole settle window must still fail closed (got: $VERIFY_OUT)"
-  assert_contains "$VERIFY_OUT" "$ESCAPED_GROUP_MEMBER_PID" \
-    "the refusal must name the process that outlived the settle window"
-  assert_contains "$retained_pids" "$ESCAPED_GROUP_MEMBER_PID" \
-    "the retained binding must name the process that outlived the settle window"
-  [ "$drain_samples" -ge "$ESCAPED_GROUP_SETTLE_WINDOW" ] \
-    || fail "the refusal was taken before the settle window closed (drain samples: $drain_samples)"
-  pass "fm-verify: a member alive through the settle window still fails closed"
-}
 
 test_build_descendant_closing_lineage_fails_closed() {
   local BUILD_CMD helper escaped_pid_file escaped_pid retained_pids
@@ -1968,7 +1957,6 @@ test_cleanly_exited_own_process_group_children_are_not_a_leak
 test_live_member_of_an_escaped_group_fails_closed
 test_reused_process_group_number_is_not_this_builds_leak
 test_escaped_group_member_that_exits_during_the_settle_is_not_a_leak
-test_escaped_group_member_alive_through_the_settle_still_fails_closed
 test_build_descendant_closing_lineage_fails_closed
 test_worktree_allocation_failure_is_not_a_product_verdict
 test_unconfirmed_worktree_cleanup_fails_closed
