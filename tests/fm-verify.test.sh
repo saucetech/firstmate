@@ -1014,7 +1014,7 @@ test_build_descendants_are_drained_before_staging() {
 }
 
 test_build_descendant_left_alive_after_drain_fails_closed() {
-  local BUILD_CMD helper leak_pid_file leak_pid retained_pids worktree container
+  local BUILD_CMD helper leak_pid_file leak_pid leak_alive retained_pids worktree container
   new_fixture leaked-build-descendant
   helper="$FIX_TMP/leak-descendant.pl"
   leak_pid_file="$FIX_TMP/leaked.pid"
@@ -1056,24 +1056,34 @@ PL
   # find it with nothing but its process group.
   BUILD_CMD="mkdir -p build; cp README.md build/app.txt; '$helper' '$leak_pid_file' & while [ ! -s '$leak_pid_file' ]; do sleep 0.05; done; exit 0"
   run_verify demo-ship --promise "$PROMISE"
+  # Record what the run left behind, then release all of it BEFORE asserting
+  # anything. This test deliberately leaks a process that ignores TERM, so an
+  # assertion that fails early must not be the reason it keeps running on the
+  # host - the first failure here would otherwise cost the suite a daemon, a
+  # worktree and a container that nothing later cleans up.
+  leak_pid=
+  leak_alive=0
+  if [ -s "$leak_pid_file" ]; then
+    leak_pid=$(cat "$leak_pid_file")
+    kill -0 "$leak_pid" 2>/dev/null && leak_alive=1
+  fi
+  retained_pids=$(awk -F= '$1 == "build_cleanup_pids" { print $2 }' "$FIX_HOME/state/demo-ship-verify.verify")
+  worktree=$(awk -F= '$1 == "build_cleanup_path" { print substr($0, index($0, "=") + 1) }' "$FIX_HOME/state/demo-ship-verify.verify")
+  container=$(awk -F= '$1 == "build_cleanup_container" { print substr($0, index($0, "=") + 1) }' "$FIX_HOME/state/demo-ship-verify.verify")
+  pkill -KILL -f "$helper" 2>/dev/null || true
+  [ -z "$leak_pid" ] || kill -KILL "$leak_pid" 2>/dev/null || true
+  git -C "$FIX_PROJ" worktree remove --force "$worktree" >/dev/null 2>&1 || true
+  /bin/rm -rf "$container"
   expect_code 1 "$VERIFY_RC" "a descendant left alive after the drain must fail closed (got: $VERIFY_OUT)"
-  [ -s "$leak_pid_file" ] || fail "the leaked descendant did not publish its pid"
-  leak_pid=$(cat "$leak_pid_file")
-  kill -0 "$leak_pid" 2>/dev/null || fail "the test did not actually leak a live process"
+  [ -n "$leak_pid" ] || fail "the leaked descendant did not publish its pid"
+  [ "$leak_alive" -eq 1 ] || fail "the test did not actually leak a live process"
   assert_contains "$VERIFY_OUT" "because build drain was not confirmed" \
     "a live leaked descendant must be reported as an unconfirmed drain"
-  retained_pids=$(awk -F= '$1 == "build_cleanup_pids" { print $2 }' "$FIX_HOME/state/demo-ship-verify.verify")
   assert_contains "$retained_pids" "$leak_pid" \
     "the retained binding must name the process that is still running"
   assert_absent "$FIX_HOME/data/demo-ship-verify/report.md" \
     "a leaked descendant must not become a product verdict"
   [ ! -s "$FIX_SPAWN_LOG" ] || fail "a leaked descendant must stop artifact staging and spawn"
-  worktree=$(awk -F= '$1 == "build_cleanup_path" { print substr($0, index($0, "=") + 1) }' "$FIX_HOME/state/demo-ship-verify.verify")
-  container=$(awk -F= '$1 == "build_cleanup_container" { print substr($0, index($0, "=") + 1) }' "$FIX_HOME/state/demo-ship-verify.verify")
-  pkill -KILL -f "$helper" 2>/dev/null || true
-  kill -KILL "$leak_pid" 2>/dev/null || true
-  git -C "$FIX_PROJ" worktree remove --force "$worktree" >/dev/null 2>&1 || true
-  /bin/rm -rf "$container"
   pass "fm-verify: descendants left alive after the drain fail closed"
 }
 
@@ -1108,6 +1118,133 @@ PL
   pass "fm-verify: cleanly exited own-process-group children are not a leak"
 }
 
+# write_escaped_group_ps <path>: a ps wrapper that projects one synthetic process
+# group into the view the build runner has of the process table, through the same
+# FM_VERIFY_PS_OVERRIDE seam the rest of this suite uses.
+#
+# While the build leader is alive it shows a descendant of that leader running in
+# a group of its own, which is what makes the runner remember the group. Once the
+# leader is gone it shows that descendant reaped and one orphan still running in
+# the same group - a process the drain never tracked and cannot reach, so the
+# group number is the only thread left back to the build. The leader row it shows
+# at that point decides whether the number still names the same group.
+#
+# The projected pids are taken from above the highest number this platform can
+# assign as a pid, so nothing here can ever name - and the drain can never aim a
+# signal at - a real process on the host.
+write_escaped_group_ps() {
+  cat > "$1" <<'SH'
+#!/usr/bin/env bash
+output=$(/bin/ps "$@") || exit $?
+printf '%s\n' "$output"
+[ -s "$FM_VERIFY_TEST_LEADER" ] || exit 0
+leader=$(cat "$FM_VERIFY_TEST_LEADER")
+if kill -0 "$leader" 2>/dev/null; then
+  printf '%s 1 %s %s S 10:00 %s\n' \
+    "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID" "$FM_VERIFY_TEST_OBSERVED_START"
+  printf '%s %s %s %s S 10:00 %s\n' \
+    "$FM_VERIFY_TEST_ESCAPEE" "$leader" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID" "$FM_VERIFY_TEST_OBSERVED_START"
+  printf 'observed\n' >> "$FM_VERIFY_TEST_MARK"
+else
+  printf '%s 1 %s %s S 10:00 %s\n' \
+    "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID" "$FM_VERIFY_TEST_DRAIN_START"
+  printf '%s 1 %s %s S 10:00 Tue Jan  2 00:00:00 2001\n' \
+    "$FM_VERIFY_TEST_MEMBER" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID"
+fi
+SH
+  chmod +x "$1"
+}
+
+# Linux publishes its ceiling; the macOS ceiling is the fixed PID_MAX of 99999.
+if [ -r /proc/sys/kernel/pid_max ]; then
+  ESCAPED_GROUP_PID_BASE=$(( $(cat /proc/sys/kernel/pid_max) + 1 ))
+else
+  ESCAPED_GROUP_PID_BASE=100000
+fi
+ESCAPED_GROUP_LEADER_PID=$((ESCAPED_GROUP_PID_BASE + 1))
+ESCAPED_GROUP_ESCAPEE_PID=$((ESCAPED_GROUP_PID_BASE + 2))
+ESCAPED_GROUP_MEMBER_PID=$((ESCAPED_GROUP_PID_BASE + 3))
+ESCAPED_GROUP_OBSERVED_START='Mon Jan  1 00:00:01 2001'
+
+# run_escaped_group_fixture <slug> <drain-leader-start>: one verification whose
+# build escapes into the projected group and leaves a live member of it behind.
+run_escaped_group_fixture() {
+  local slug=$1 drain_start=$2 fake_ps leader mark
+  new_fixture "$slug"
+  fake_ps="$FIX_TMP/escaped-group-ps"
+  leader="$FIX_TMP/build-leader.pid"
+  mark="$FIX_TMP/escaped-group-observed"
+  : > "$mark"
+  write_escaped_group_ps "$fake_ps"
+  # The build publishes its own pid - it is the runner's forked leader - and then
+  # waits until the runner has actually sampled the process table twice with the
+  # group in it, so observation is a fact of the run rather than a race with it.
+  VERIFY_OUT=$(TMPDIR="$FIX_TMP" FM_HOME="$FIX_HOME" FM_VERIFY_SPAWN_OVERRIDE="$FIX_SPAWN" \
+    FM_VERIFY_PS_OVERRIDE="$fake_ps" \
+    FM_VERIFY_TEST_LEADER="$leader" FM_VERIFY_TEST_MARK="$mark" FM_VERIFY_TEST_UID="$(id -u)" \
+    FM_VERIFY_TEST_GROUP="$ESCAPED_GROUP_LEADER_PID" \
+    FM_VERIFY_TEST_ESCAPEE="$ESCAPED_GROUP_ESCAPEE_PID" \
+    FM_VERIFY_TEST_MEMBER="$ESCAPED_GROUP_MEMBER_PID" \
+    FM_VERIFY_TEST_OBSERVED_START="$ESCAPED_GROUP_OBSERVED_START" \
+    FM_VERIFY_TEST_DRAIN_START="$drain_start" \
+    "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
+    --build-cmd "printf '%s\n' \$\$ > '$leader'; mkdir -p build; cp README.md build/app.txt; while [ \"\$(wc -l < '$mark')\" -lt 2 ]; do sleep 0.05; done; exit 0" \
+    --artifact "$BUILD_ARTIFACT" 2>&1)
+  VERIFY_RC=$?
+  [ "$(wc -l < "$mark")" -ge 2 ] || fail "the runner never observed the escaped process group"
+  return 0
+}
+
+test_live_member_of_an_escaped_group_fails_closed() {
+  local retained_pids worktree container
+  # The group half of the containment check, on the process it exists for: an
+  # orphan the drain never tracked, still running in a group the build entered,
+  # with that group still led by the same process. Binding the group to an
+  # identity must not cost the check this refusal.
+  run_escaped_group_fixture escaped-group-still-ours "$ESCAPED_GROUP_OBSERVED_START"
+  # Read the binding and release the retained build state before asserting
+  # anything: an assertion that fails here must not also leave a worktree and a
+  # container behind on the host running the suite.
+  retained_pids=$(awk -F= '$1 == "build_cleanup_pids" { print $2 }' "$FIX_HOME/state/demo-ship-verify.verify")
+  worktree=$(awk -F= '$1 == "build_cleanup_path" { print substr($0, index($0, "=") + 1) }' "$FIX_HOME/state/demo-ship-verify.verify")
+  container=$(awk -F= '$1 == "build_cleanup_container" { print substr($0, index($0, "=") + 1) }' "$FIX_HOME/state/demo-ship-verify.verify")
+  git -C "$FIX_PROJ" worktree remove --force "$worktree" >/dev/null 2>&1 || true
+  /bin/rm -rf "$container"
+  expect_code 1 "$VERIFY_RC" \
+    "a live member of an escaped group must fail closed (got: $VERIFY_OUT)"
+  assert_contains "$VERIFY_OUT" "because build drain was not confirmed" \
+    "a live escaped descendant must be reported as an unconfirmed drain"
+  # The refusal has to say what is still running and why the run stopped. A
+  # containment result the caller cannot explain is how a real leak gets read as
+  # a broken tool and retried, so this refusal owns its own sentence rather than
+  # falling through to the unrecognized-result path.
+  assert_contains "$VERIFY_OUT" "$ESCAPED_GROUP_MEMBER_PID" \
+    "the refusal must name the process that is still running"
+  assert_contains "$VERIFY_OUT" "process groups it escaped into" \
+    "the refusal must explain that the build left processes running behind it"
+  assert_contains "$retained_pids" "$ESCAPED_GROUP_MEMBER_PID" \
+    "the retained binding must name the surviving member of the escaped group"
+  assert_absent "$FIX_HOME/data/demo-ship-verify/report.md" \
+    "an unconfirmed drain must not become a product verdict"
+  pass "fm-verify: live members of an escaped process group fail closed"
+}
+
+test_reused_process_group_number_is_not_this_builds_leak() {
+  # The same shape, with one difference that decides everything: the group number
+  # is now led by a different process than the one the build escaped into, which
+  # is what a pid counter wrapping during a long build leaves behind. The live
+  # process wearing that number belongs to a stranger, and the check must not
+  # convict it - a false leak strands a build worktree and sends whoever reads the
+  # refusal after a process that has nothing to do with this build.
+  run_escaped_group_fixture escaped-group-number-reused 'Wed Mar  3 12:00:00 2003'
+  expect_code 0 "$VERIFY_RC" \
+    "a reused process group number must not fail the build (got: $VERIFY_OUT)"
+  assert_not_contains "$VERIFY_OUT" "because build drain was not confirmed" \
+    "a stranger wearing a remembered group number must not be reported as a leak"
+  [ -s "$FIX_SPAWN_LOG" ] || fail "the verification must reach the verifier spawn"
+  pass "fm-verify: a reused process group number is not this build's leak"
+}
+
 test_build_descendant_closing_lineage_fails_closed() {
   local BUILD_CMD helper escaped_pid_file escaped_pid retained_pids worktree container
   new_fixture closed-lineage-descendant
@@ -1139,20 +1276,25 @@ PL
   # revert of the feature instead of a fix to the timing assumption.
   BUILD_CMD="mkdir -p build; cp README.md build/app.txt; '$helper' '$escaped_pid_file'; while [ ! -s '$escaped_pid_file' ]; do sleep 0.05; done; exit 0"
   run_verify demo-ship --promise "$PROMISE"
+  # Same ordering rule as the sibling leak test: this daemon also ignores TERM,
+  # so everything the run left running or on disk is released before the first
+  # assertion that can end this test.
+  escaped_pid=
+  [ ! -s "$escaped_pid_file" ] || escaped_pid=$(cat "$escaped_pid_file")
+  retained_pids=$(awk -F= '$1 == "build_cleanup_pids" { print $2 }' "$FIX_HOME/state/demo-ship-verify.verify")
+  worktree=$(awk -F= '$1 == "build_cleanup_path" { print substr($0, index($0, "=") + 1) }' "$FIX_HOME/state/demo-ship-verify.verify")
+  container=$(awk -F= '$1 == "build_cleanup_container" { print substr($0, index($0, "=") + 1) }' "$FIX_HOME/state/demo-ship-verify.verify")
+  pkill -KILL -f "$helper" 2>/dev/null || true
+  [ -z "$escaped_pid" ] || kill -KILL "$escaped_pid" 2>/dev/null || true
+  git -C "$FIX_PROJ" worktree remove --force "$worktree" >/dev/null 2>&1 || true
+  /bin/rm -rf "$container"
   expect_code 1 "$VERIFY_RC" "a descriptor-closing daemon must fail closed (got: $VERIFY_OUT)"
-  [ -s "$escaped_pid_file" ] || fail "the descriptor-closing descendant did not publish its pid"
-  escaped_pid=$(cat "$escaped_pid_file")
+  [ -n "$escaped_pid" ] || fail "the descriptor-closing descendant did not publish its pid"
   assert_contains "$VERIFY_OUT" "lineage continuity was lost" \
     "the refusal must identify the lost lineage boundary"
-  retained_pids=$(awk -F= '$1 == "build_cleanup_pids" { print $2 }' "$FIX_HOME/state/demo-ship-verify.verify")
   assert_contains "$retained_pids" "$escaped_pid" \
     "the retained binding must identify the unaccounted descendant"
   [ ! -s "$FIX_SPAWN_LOG" ] || fail "lost lineage must stop before verifier spawn"
-  worktree=$(awk -F= '$1 == "build_cleanup_path" { print substr($0, index($0, "=") + 1) }' "$FIX_HOME/state/demo-ship-verify.verify")
-  container=$(awk -F= '$1 == "build_cleanup_container" { print substr($0, index($0, "=") + 1) }' "$FIX_HOME/state/demo-ship-verify.verify")
-  kill -KILL "$escaped_pid" 2>/dev/null || true
-  git -C "$FIX_PROJ" worktree remove --force "$worktree" >/dev/null 2>&1 || true
-  /bin/rm -rf "$container"
   pass "fm-verify: descriptor-closing descendants fail closed"
 }
 
@@ -1743,6 +1885,8 @@ test_build_cannot_forge_runner_status
 test_build_descendants_are_drained_before_staging
 test_build_descendant_left_alive_after_drain_fails_closed
 test_cleanly_exited_own_process_group_children_are_not_a_leak
+test_live_member_of_an_escaped_group_fails_closed
+test_reused_process_group_number_is_not_this_builds_leak
 test_build_descendant_closing_lineage_fails_closed
 test_worktree_allocation_failure_is_not_a_product_verdict
 test_unconfirmed_worktree_cleanup_fails_closed

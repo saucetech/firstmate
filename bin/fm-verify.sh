@@ -948,6 +948,37 @@ run_build_with_timeout() {
       return "lsof-exit:$lineage_lsof_status" unless $lineage_lsof_status == 0 || $lineage_lsof_status == 1;
       return "";
     };
+    # A remembered process group is a lead back to this build only for as long as
+    # the number still names the same group. Pid numbers wrap, so each group is
+    # bound to the identity of its leader, exactly the way a tracked pid is bound
+    # to the start time of the process that holds it. Without that binding a long
+    # build hands the drain check a bare number, and an unrelated process that has
+    # since become the leader of a group with that number is reported as a leak of
+    # this build - a confident false accusation from the check whose whole job is
+    # to be trustworthy about containment.
+    #
+    # An identity that cannot be read stays unknown, and unknown fails closed:
+    # the number cannot be handed out again while the group still has members, so
+    # a live member with no visible leader is far more likely to be an escape of
+    # this build than a coincidence, and the cost of being wrong the other way is
+    # a host process left running behind a green verification.
+    $remember_escaped_group = sub {
+      $escaped_group = shift;
+      $escaped_group_leader = exists($processes->{$escaped_group})
+        ? $processes->{$escaped_group}->{start}
+        : "";
+      if (!exists($escaped_groups{$escaped_group})) {
+        $escaped_groups{$escaped_group} = $escaped_group_leader;
+        return;
+      }
+      # A leader that has since exited erases nothing: it is the normal end of a
+      # group, not a change of identity. A leader that is a different process is
+      # the number changing hands mid-build, and neither group can be ruled out
+      # from then on.
+      return if $escaped_group_leader eq "";
+      return if $escaped_groups{$escaped_group} eq $escaped_group_leader;
+      $escaped_groups{$escaped_group} = "";
+    };
     $refresh_descendants = sub {
       ($processes, $snapshot_error) = $snapshot->();
       return (undef, $snapshot_error) unless defined($processes);
@@ -967,7 +998,7 @@ run_build_with_timeout() {
             $tracked_start{$lineage_pid} = $processes->{$lineage_pid}->{start};
             if ($lineage_pid != $pid && $processes->{$lineage_pid}->{pgid} != $pid) {
               $escaped_start{$lineage_pid} = $processes->{$lineage_pid}->{start};
-              $escaped_groups{$processes->{$lineage_pid}->{pgid}} = 1;
+              $remember_escaped_group->($processes->{$lineage_pid}->{pgid});
             }
           }
         }
@@ -995,7 +1026,7 @@ run_build_with_timeout() {
           }
           if ($candidate != $pid && $entry->{pgid} != $pid) {
             $escaped_start{$candidate} = $entry->{start};
-            $escaped_groups{$entry->{pgid}} = 1;
+            $remember_escaped_group->($entry->{pgid});
           }
         }
       }
@@ -1091,7 +1122,9 @@ run_build_with_timeout() {
     # set died before any snapshot saw it, so it is parented to init, and whose
     # working directory is outside the build root, so the unaccounted-lineage
     # scan does not claim it either. Its process group is the only thread back to
-    # the build, which is why the group is remembered rather than just counted.
+    # the build, which is why the group is remembered rather than just counted -
+    # bound to the identity of its leader, so the number alone can never convict
+    # a stranger (see $remember_escaped_group).
     #
     # Do NOT restore the old test - refusing whenever %escaped_start is non-empty.
     # It asserted history instead of liveness: it blocked every iOS verification
@@ -1111,6 +1144,11 @@ run_build_with_timeout() {
           next;
         }
         next unless exists($escaped_groups{$entry->{pgid}});
+        # Same number, different group leader: a group this build never entered.
+        $escaped_group_identity = $escaped_groups{$entry->{pgid}};
+        next if $escaped_group_identity ne ""
+          && exists($processes->{$entry->{pgid}})
+          && $processes->{$entry->{pgid}}->{start} ne $escaped_group_identity;
         next if exists($baseline_start{$candidate}) && $baseline_start{$candidate} eq $entry->{start};
         $live_escaped_pid{$candidate} = 1;
       }
@@ -1472,6 +1510,11 @@ case "$RUNNER_RESULT" in
   undrained:lineage=*)
     cleanup_build_worktree || true
     echo "BLOCKED: build lineage continuity was lost for surviving pids ${RUNNER_RESULT#undrained:lineage=}; no product verdict was recorded" >&2
+    exit 1
+    ;;
+  undrained:escaped=*)
+    cleanup_build_worktree || true
+    echo "BLOCKED: the build left processes running in process groups it escaped into: ${RUNNER_RESULT#undrained:escaped=}; no product verdict was recorded" >&2
     exit 1
     ;;
   *) RUNNER_RESULT=invalid ;;
