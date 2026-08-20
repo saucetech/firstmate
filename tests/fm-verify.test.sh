@@ -1152,6 +1152,13 @@ PL
 # that many drain-phase samples, projecting the toolchain group that is on its
 # way out while the check is looking at it; empty keeps it running for good.
 #
+# FM_VERIFY_TEST_BLINK_SAMPLE optionally omits both rows for exactly ONE
+# drain-phase sample and then resumes, projecting the other thing a snapshot
+# does: miss a process that never stopped running. A group that is alive
+# throughout but absent from one sample is what separates a verdict taken at the
+# close of the settle window from one that retires a suspect the first time a
+# sample fails to report it.
+#
 # The projected pids are taken from above the highest number this platform can
 # assign as a pid, so nothing here can ever name - and the drain can never aim a
 # signal at - a real process on the host.
@@ -1170,8 +1177,12 @@ if kill -0 "$leader" 2>/dev/null; then
   printf 'observed\n' >> "$FM_VERIFY_TEST_MARK"
 else
   printf 'drained\n' >> "$FM_VERIFY_TEST_DRAIN_MARK"
+  drain_samples=$(wc -l < "$FM_VERIFY_TEST_DRAIN_MARK")
+  if [ -n "$FM_VERIFY_TEST_BLINK_SAMPLE" ] && [ "$drain_samples" -eq "$FM_VERIFY_TEST_BLINK_SAMPLE" ]; then
+    exit 0
+  fi
   if [ -z "$FM_VERIFY_TEST_GROUP_SAMPLES" ] \
-     || [ "$(wc -l < "$FM_VERIFY_TEST_DRAIN_MARK")" -le "$FM_VERIFY_TEST_GROUP_SAMPLES" ]; then
+     || [ "$drain_samples" -le "$FM_VERIFY_TEST_GROUP_SAMPLES" ]; then
     printf '%s 1 %s %s S 10:00 %s\n' \
       "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID" "$FM_VERIFY_TEST_DRAIN_START"
     printf '%s 1 %s %s S 10:00 Tue Jan  2 00:00:00 2001\n' \
@@ -1200,13 +1211,19 @@ ESCAPED_GROUP_SETTLE_WINDOW=20
 # group is genuinely caught alive by it, and fewer than the window is long, so it
 # stops being reported while the window is still open.
 ESCAPED_GROUP_SETTLE_SAMPLES=12
+# The one sample a still-running group is projected as missing. It has to land
+# strictly inside the window - after the sample that produces the first non-empty
+# verdict, which is around the fifth, and never on the closing sample, which is
+# the only one that decides.
+ESCAPED_GROUP_SETTLE_BLINK=12
 
-# run_escaped_group_fixture <slug> <drain-leader-start> [group-samples]: one
-# verification whose build escapes into the projected group and leaves members
-# of it behind - running for good, or for that many drain-phase samples.
+# run_escaped_group_fixture <slug> <drain-leader-start> [group-samples] [blink-sample]:
+# one verification whose build escapes into the projected group and leaves members
+# of it behind - running for good, or for that many drain-phase samples, and
+# optionally missing from the one drain-phase sample named by blink-sample.
 # ESCAPED_GROUP_DRAIN_MARK holds one line per drain-phase sample of the run.
 run_escaped_group_fixture() {
-  local slug=$1 drain_start=$2 group_samples=${3:-} fake_ps leader mark
+  local slug=$1 drain_start=$2 group_samples=${3:-} blink_sample=${4:-} fake_ps leader mark
   new_fixture "$slug"
   fake_ps="$FIX_TMP/escaped-group-ps"
   leader="$FIX_TMP/build-leader.pid"
@@ -1228,6 +1245,7 @@ run_escaped_group_fixture() {
     FM_VERIFY_TEST_DRAIN_START="$drain_start" \
     FM_VERIFY_TEST_DRAIN_MARK="$ESCAPED_GROUP_DRAIN_MARK" \
     FM_VERIFY_TEST_GROUP_SAMPLES="$group_samples" \
+    FM_VERIFY_TEST_BLINK_SAMPLE="$blink_sample" \
     "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd "printf '%s\n' \$\$ > '$leader'; mkdir -p build; cp README.md build/app.txt; while [ \"\$(wc -l < '$mark')\" -lt 2 ]; do sleep 0.05; done; exit 0" \
     --artifact "$BUILD_ARTIFACT" 2>&1)
@@ -1241,10 +1259,18 @@ test_live_member_of_an_escaped_group_fails_closed() {
   # The group half of the containment check, on the process it exists for: an
   # orphan the drain never tracked, still running in a group the build entered,
   # with that group still led by the same process. Binding the group to an
-  # identity must not cost the check this refusal, and neither may re-polling
-  # it: this member is reported by every sample of the settle window, including
-  # the closing one, which is the whole definition of a leak.
-  run_escaped_group_fixture escaped-group-still-ours "$ESCAPED_GROUP_OBSERVED_START"
+  # identity must not cost the check this refusal, and neither may re-polling it.
+  #
+  # The group is projected as missing from exactly one sample in the middle of
+  # the settle window and reported by every other sample, including the closing
+  # one. That blink is the whole point of the fixture, not noise to be tidied
+  # away: under the rule this check actually uses, an intermediate absence is
+  # inconclusive and the run still refuses, while under a rule that retires a
+  # suspect the first time a sample fails to report it the member is dropped at
+  # the blink and the build wrongly proceeds with it still running. Remove the
+  # blink and the difference between those two rules stops being tested.
+  run_escaped_group_fixture escaped-group-still-ours "$ESCAPED_GROUP_OBSERVED_START" \
+    "" "$ESCAPED_GROUP_SETTLE_BLINK"
   drain_samples=$(wc -l < "$ESCAPED_GROUP_DRAIN_MARK")
   retained_pids=$(release_retained_build_state)
   expect_code 1 "$VERIFY_RC" \
