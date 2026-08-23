@@ -1168,34 +1168,41 @@ run_build_with_timeout() {
     # refusal after a process that has already gone.
     #
     # So re-sample on the cadence $wait_all_gone uses, let the window run out,
-    # and refuse on the suspects the CLOSING sample still reports. Only the last
-    # sample is evidence: an intermediate one that omits a suspect is the same
-    # unreliable observation this window exists to absorb, so it is inconclusive
-    # rather than an acquittal - treating it as one would let a single miss on a
-    # loaded host clear a real leak and hand the build a green verification with
-    # a host process still running behind it, which is the worse of the two
-    # errors. This costs a normal build nothing - it runs only once a suspect
-    # exists - and softens nothing: a genuinely leaked process is still running
-    # when a window this short closes, which is what makes it a leak. A snapshot
-    # that cannot be taken stays an error, exactly as it is outside the window.
-    # Do not collapse this back to a single sample, and do not let an
-    # intermediate sample retire a suspect.
+    # and refuse on the pids the CLOSING sample reports that any earlier
+    # observation - the suspect set or a mid-window sample - also reported. Only
+    # the closing sample convicts: an intermediate one that omits a suspect is
+    # the same unreliable observation this window exists to absorb, so it is
+    # inconclusive rather than an acquittal - treating it as one would let a
+    # single miss on a loaded host clear a real leak and hand the build a green
+    # verification with a host process still running behind it, which is the
+    # worse of the two errors. Corroboration cuts both ways: a leaked process
+    # that hands its escaped group off to a child and exits mid-window leaves a
+    # successor the samples it spans have seen, so the closing sample still
+    # convicts it, while a late helper only the closing sample ever catches
+    # keeps the single-sample grace this window exists to give. This costs a
+    # normal build nothing - it runs only once a suspect exists - and softens
+    # nothing: a genuinely leaked process is still running when a window this
+    # short closes, which is what makes it a leak. A snapshot that cannot be
+    # taken stays an error, exactly as it is outside the window. Do not collapse
+    # this back to a single sample, do not let an intermediate sample retire a
+    # suspect, and do not judge the closing sample against the opening suspects
+    # alone.
     $settle_live_escaped = sub {
       $settle_suspects = shift;
       $settle_attempts = shift;
       # Copied before the first re-poll on purpose: the suspect list aliases the
       # array $live_escaped_descendants rebuilds on every call.
-      %settle_suspect_pid = map { $_ => 1 } @{$settle_suspects};
+      %settle_seen_pid = map { $_ => 1 } @{$settle_suspects};
       # Seeded with the suspects so a window that closes without ever sampling
       # refuses rather than acquits, the same way every other ambiguity here does.
-      %settle_still_live = %settle_suspect_pid;
+      @settle_survivors = keys %settle_seen_pid;
       for (1 .. $settle_attempts) {
         select undef, undef, undef, 0.05;
         ($settle_live, $settle_error) = $live_escaped_descendants->();
         return (undef, $settle_error) unless defined($settle_live);
-        %settle_still_live = map { $_ => 1 } @{$settle_live};
+        @settle_survivors = grep { exists($settle_seen_pid{$_}) } @{$settle_live};
+        $settle_seen_pid{$_} = 1 for @{$settle_live};
       }
-      @settle_survivors = grep { exists($settle_still_live{$_}) } keys %settle_suspect_pid;
       return (\@settle_survivors, "");
     };
     $terminate_all = sub {

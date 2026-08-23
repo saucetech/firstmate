@@ -1159,6 +1159,15 @@ PL
 # close of the settle window from one that retires a suspect the first time a
 # sample fails to report it.
 #
+# FM_VERIFY_TEST_HANDOFF_SAMPLE optionally replaces the group, from that
+# drain-phase sample onward, with FM_VERIFY_TEST_SUCCESSOR: the leader and
+# member rows stop and one new pid is reported in the same group instead - the
+# daemonize handoff, where the member the opening sample caught forks a
+# replacement into its group and exits behind it. The successor spans every
+# sample from the handoff to the close, which separates a closing verdict that
+# accepts mid-window corroboration from one that intersects the closing sample
+# with the opening suspects alone.
+#
 # The projected pids are taken from above the highest number this platform can
 # assign as a pid, so nothing here can ever name - and the drain can never aim a
 # signal at - a real process on the host.
@@ -1179,6 +1188,11 @@ else
   printf 'drained\n' >> "$FM_VERIFY_TEST_DRAIN_MARK"
   drain_samples=$(wc -l < "$FM_VERIFY_TEST_DRAIN_MARK")
   if [ -n "$FM_VERIFY_TEST_BLINK_SAMPLE" ] && [ "$drain_samples" -eq "$FM_VERIFY_TEST_BLINK_SAMPLE" ]; then
+    exit 0
+  fi
+  if [ -n "$FM_VERIFY_TEST_HANDOFF_SAMPLE" ] && [ "$drain_samples" -ge "$FM_VERIFY_TEST_HANDOFF_SAMPLE" ]; then
+    printf '%s 1 %s %s S 10:00 Tue Jan  2 00:00:02 2001\n' \
+      "$FM_VERIFY_TEST_SUCCESSOR" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID"
     exit 0
   fi
   if [ -z "$FM_VERIFY_TEST_GROUP_SAMPLES" ] \
@@ -1202,6 +1216,7 @@ fi
 ESCAPED_GROUP_LEADER_PID=$((ESCAPED_GROUP_PID_BASE + 1))
 ESCAPED_GROUP_ESCAPEE_PID=$((ESCAPED_GROUP_PID_BASE + 2))
 ESCAPED_GROUP_MEMBER_PID=$((ESCAPED_GROUP_PID_BASE + 3))
+ESCAPED_GROUP_SUCCESSOR_PID=$((ESCAPED_GROUP_PID_BASE + 4))
 ESCAPED_GROUP_OBSERVED_START='Mon Jan  1 00:00:01 2001'
 # The re-poll the runner gives a suspected escape before it calls it a leak: 20
 # samples on the drain cadence. Kept in step with the budget passed to
@@ -1212,18 +1227,28 @@ ESCAPED_GROUP_SETTLE_WINDOW=20
 # stops being reported while the window is still open.
 ESCAPED_GROUP_SETTLE_SAMPLES=12
 # The one sample a still-running group is projected as missing. It has to land
-# strictly inside the window - after the sample that produces the first non-empty
-# verdict, which is around the fifth, and never on the closing sample, which is
+# strictly inside the window: after the sample that opens it with the first
+# non-empty verdict - which lineage-scan retries and drain re-polls on a loaded
+# host can push out to roughly the twelfth drain-phase sample - and before the
+# closing sample, which never arrives before roughly the twenty-fifth and is
 # the only one that decides.
-ESCAPED_GROUP_SETTLE_BLINK=12
+ESCAPED_GROUP_SETTLE_BLINK=17
+# The drain-phase sample where the projected group swaps its members for the
+# successor. Bounded on both sides the same way the blink is: late enough that
+# the opening sample has already taken the original members as its suspects,
+# early enough that mid-window samples corroborate the successor before the
+# closing sample rules on it.
+ESCAPED_GROUP_SETTLE_HANDOFF=17
 
-# run_escaped_group_fixture <slug> <drain-leader-start> [group-samples] [blink-sample]:
+# run_escaped_group_fixture <slug> <drain-leader-start> [group-samples] [blink-sample] [handoff-sample]:
 # one verification whose build escapes into the projected group and leaves members
-# of it behind - running for good, or for that many drain-phase samples, and
-# optionally missing from the one drain-phase sample named by blink-sample.
+# of it behind - running for good, or for that many drain-phase samples,
+# optionally missing from the one drain-phase sample named by blink-sample, and
+# optionally handed off to the successor from the drain-phase sample named by
+# handoff-sample onward.
 # ESCAPED_GROUP_DRAIN_MARK holds one line per drain-phase sample of the run.
 run_escaped_group_fixture() {
-  local slug=$1 drain_start=$2 group_samples=${3:-} blink_sample=${4:-} fake_ps leader mark
+  local slug=$1 drain_start=$2 group_samples=${3:-} blink_sample=${4:-} handoff_sample=${5:-} fake_ps leader mark
   new_fixture "$slug"
   fake_ps="$FIX_TMP/escaped-group-ps"
   leader="$FIX_TMP/build-leader.pid"
@@ -1246,6 +1271,8 @@ run_escaped_group_fixture() {
     FM_VERIFY_TEST_DRAIN_MARK="$ESCAPED_GROUP_DRAIN_MARK" \
     FM_VERIFY_TEST_GROUP_SAMPLES="$group_samples" \
     FM_VERIFY_TEST_BLINK_SAMPLE="$blink_sample" \
+    FM_VERIFY_TEST_HANDOFF_SAMPLE="$handoff_sample" \
+    FM_VERIFY_TEST_SUCCESSOR="$ESCAPED_GROUP_SUCCESSOR_PID" \
     "$ROOT/bin/fm-verify.sh" demo-ship --verify-id demo-ship-verify --promise "$PROMISE" \
     --build-cmd "printf '%s\n' \$\$ > '$leader'; mkdir -p build; cp README.md build/app.txt; while [ \"\$(wc -l < '$mark')\" -lt 2 ]; do sleep 0.05; done; exit 0" \
     --artifact "$BUILD_ARTIFACT" 2>&1)
@@ -1335,6 +1362,38 @@ test_escaped_group_member_that_exits_during_the_settle_is_not_a_leak() {
     || fail "the runner never re-sampled the escaped group (drain samples: $drain_samples)"
   [ -s "$FIX_SPAWN_LOG" ] || fail "the verification must reach the verifier spawn"
   pass "fm-verify: an escaped-group member that exits during the settle is not a leak"
+}
+
+test_escaped_group_handoff_to_a_new_member_fails_closed() {
+  local retained_pids drain_samples
+  # The daemonize handoff: the member the opening sample caught forks a
+  # replacement into the same escaped group and exits mid-window, so the closing
+  # sample reports a pid the opening suspect set never held while every original
+  # suspect is gone. A build process is still running when the window shuts, and
+  # swapping pids inside the group must not launder it into a green
+  # verification: the successor was seen by every sample it spans, so the
+  # closing sample convicts it. Under a rule that intersects the closing sample
+  # with the opening suspects alone this run exits 0 with the successor still
+  # live, which is the fail-open this fixture exists to block.
+  run_escaped_group_fixture escaped-group-handoff "$ESCAPED_GROUP_OBSERVED_START" \
+    "" "" "$ESCAPED_GROUP_SETTLE_HANDOFF"
+  drain_samples=$(wc -l < "$ESCAPED_GROUP_DRAIN_MARK")
+  retained_pids=$(release_retained_build_state)
+  expect_code 1 "$VERIFY_RC" \
+    "a handoff to a new member of an escaped group must fail closed (got: $VERIFY_OUT)"
+  assert_contains "$VERIFY_OUT" "because build drain was not confirmed" \
+    "a handed-off live escapee must be reported as an unconfirmed drain"
+  assert_contains "$VERIFY_OUT" "$ESCAPED_GROUP_SUCCESSOR_PID" \
+    "the refusal must name the successor that is still running"
+  assert_contains "$VERIFY_OUT" "process groups it escaped into" \
+    "the refusal must explain that the build left processes running behind it"
+  assert_contains "$retained_pids" "$ESCAPED_GROUP_SUCCESSOR_PID" \
+    "the retained binding must name the surviving successor"
+  assert_absent "$FIX_HOME/data/demo-ship-verify/report.md" \
+    "an unconfirmed drain must not become a product verdict"
+  [ "$drain_samples" -ge "$ESCAPED_GROUP_SETTLE_WINDOW" ] \
+    || fail "the refusal was taken before the settle window closed (drain samples: $drain_samples)"
+  pass "fm-verify: an escaped-group handoff to a new member fails closed"
 }
 
 
@@ -1983,6 +2042,7 @@ test_cleanly_exited_own_process_group_children_are_not_a_leak
 test_live_member_of_an_escaped_group_fails_closed
 test_reused_process_group_number_is_not_this_builds_leak
 test_escaped_group_member_that_exits_during_the_settle_is_not_a_leak
+test_escaped_group_handoff_to_a_new_member_fails_closed
 test_build_descendant_closing_lineage_fails_closed
 test_worktree_allocation_failure_is_not_a_product_verdict
 test_unconfirmed_worktree_cleanup_fails_closed
