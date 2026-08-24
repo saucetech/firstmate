@@ -387,6 +387,36 @@ signal_crew_provably_working() {  # <file> ...
   return 0
 }
 
+# 0 (all declared-paused) if EVERY task referenced by a no-verb "signal:" wake has
+# a declared-pause (paused:) last status line; 1 if any is not, or no task can be
+# resolved. Pass the same space-separated file list as signal_reason_is_actionable.
+# Unlike signal_crew_provably_working, this is a pure status-line read - it never
+# calls fm-crew-state.sh - because the pause verb on the CURRENT last line is
+# definitive on its own: a crew that appended working: or a terminal verb after a
+# pause already fails this check, since last_status_line returns THAT line, not
+# the earlier paused: one, so classification reverts immediately. The watcher
+# treats an all-paused signal wake as an absorb class alongside provably-working,
+# subject to its own bounded re-surface cadence (signal_pause_resurface_due).
+signal_crew_declared_paused() {  # <file> ...
+  local f dir base task seen="" last
+  for f in "$@"; do
+    dir=${f%/*}
+    base=${f##*/}
+    case "$base" in
+      *.status)     task=${base%.status} ;;
+      *.turn-ended) task=${base%.turn-ended} ;;
+      *)            continue ;;
+    esac
+    [ -n "$task" ] || continue
+    case " $seen " in *" $task "*) continue ;; esac
+    seen="$seen $task"
+    last=$(last_status_line "$dir/$task.status")
+    status_is_paused "$last" || return 1
+  done
+  [ -n "$seen" ] || return 1
+  return 0
+}
+
 # 0 (terminal/actionable) if a stale window's last status line is
 # captain-relevant; 1 otherwise, including the no-status case. A 1 only means
 # "non-terminal"; the always-on watcher then applies crew_is_provably_working,

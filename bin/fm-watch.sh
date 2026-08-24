@@ -390,6 +390,43 @@ handle_paused_stale() {  # <window> <task> <hash>
   triage_log "absorbed stale (paused, awaiting external, age ${age}s): $win"
 }
 
+# Bounded recheck for a no-verb signal wake absorbed only because
+# signal_crew_declared_paused reports every referenced task paused: fires once
+# per PAUSE_RESURFACE_SECS per task so a forgotten pause on the signal path
+# cannot rot invisibly, mirroring handle_paused_stale's cadence. Keyed by task
+# id (.paused-signal-resurfaced-<task>) rather than a window key, since the
+# signal path classifies before the stale loop below resolves any window.
+# Anchored on each task's status file mtime, exactly like the stale path, so a
+# churny status write cannot itself reset the age (only a genuinely new status
+# append ages the cadence, and a paused wake caused by such an append is itself
+# a legitimate recheck). Touches the marker ONLY for a task it reports due,
+# the same single-touch discipline as handle_paused_stale.
+signal_pause_resurface_due() {  # <file> ...
+  local f dir base task seen="" statusf age rf rf_age result=1
+  for f in "$@"; do
+    dir=${f%/*}
+    base=${f##*/}
+    case "$base" in
+      *.status)     task=${base%.status} ;;
+      *.turn-ended) task=${base%.turn-ended} ;;
+      *)            continue ;;
+    esac
+    [ -n "$task" ] || continue
+    case " $seen " in *" $task "*) continue ;; esac
+    seen="$seen $task"
+    statusf="$dir/$task.status"
+    age=$(age_of "$statusf")
+    rf="$dir/.paused-signal-resurfaced-$task"
+    rf_age=$(age_of "$rf")
+    if [ "$age" -ge "$PAUSE_RESURFACE_SECS" ] && [ "$rf_age" -ge "$PAUSE_RESURFACE_SECS" ]; then
+      date +%s > "$rf"
+      result=0
+    fi
+  done
+  [ -n "$seen" ] || return 1
+  return "$result"
+}
+
 clear_pause_state() {  # <window>
   local win=$1 key
   key=${win//:/_}
@@ -934,11 +971,32 @@ EOF
     #     such a turn-end is exactly the swallowed-finish this change guards against.
     # Actionable -> enqueue, advance .seen-* markers, exit. Benign (a no-verb wake
     # whose crew IS provably working) in always-on mode -> advance the markers so it
-    # will not re-fire, log, and keep blocking without enqueuing. The provably-working
-    # check is the only costly one (it may run a bounded no-mistakes call), so the ||
-    # ordering evaluates it ONLY for a non-afk, no-captain-verb signal.
+    # will not re-fire, log, and keep blocking without enqueuing. A no-verb wake
+    # whose crew is instead declared paused (signal_crew_declared_paused) is the
+    # same absorb class, subject to its own bounded PAUSE_RESURFACE_SECS recheck
+    # (signal_pause_resurface_due) so a forgotten pause cannot rot invisibly; a
+    # terminal verb already took the actionable branch above regardless of any
+    # earlier pause, and a crew that appends working: after a pause reads as
+    # neither actionable nor paused here, so it falls through to the ordinary
+    # provably-working test. The provably-working check is the only costly one
+    # (it may run a bounded no-mistakes call), so the || ordering evaluates it
+    # ONLY for a non-afk, no-captain-verb signal.
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
-    if afk_present || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
+    if afk_present || signal_reason_is_actionable $files; then
+      surface_signal=1
+    elif signal_crew_provably_working $files; then
+      surface_signal=0
+    elif signal_crew_declared_paused $files; then
+      if signal_pause_resurface_due $files; then
+        surface_signal=1
+        reason="$reason (declared pause, rechecked on a long cadence not a wedge; confirm the wait still holds)"
+      else
+        surface_signal=0
+      fi
+    else
+      surface_signal=1
+    fi
+    if [ "$surface_signal" -eq 1 ]; then
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
         fm_wake_append signal "$(basename "$f")" "$reason" || exit 1

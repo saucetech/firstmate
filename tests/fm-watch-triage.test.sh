@@ -351,6 +351,34 @@ test_signal_crew_provably_working_classifier() {
   pass "signal_crew_provably_working: benign only when every referenced crew is provably working"
 }
 
+# signal_crew_declared_paused: the signal-path counterpart of
+# signal_crew_provably_working. Unlike that predicate it is a PURE status-line
+# read (no fm-crew-state.sh call) - the pause verb on the CURRENT last line is
+# definitive on its own, so a task whose last line has since moved past paused:
+# (a terminal verb, or a working: note) already fails this check because
+# last_status_line returns that newer line.
+test_signal_crew_declared_paused_classifier() {
+  local dir state
+  dir=$(make_case signal-declared-paused); state="$dir/state"
+  printf 'paused: holding for the upstream release\n' > "$state/a.status"
+  printf 'paused: waiting on a rate-limit reset\n' > "$state/b.status"
+  signal_crew_declared_paused "$state/a.status" "$state/a.turn-ended" \
+    || fail "a single declared-paused task (status+turn-end) was not classed all-paused"
+  signal_crew_declared_paused "$state/a.status" "$state/b.status" \
+    || fail "two declared-paused tasks were not classed all-paused"
+  printf 'done: shipped\n' > "$state/c.status"
+  ! signal_crew_declared_paused "$state/a.status" "$state/c.turn-ended" \
+    || fail "a coalesced batch including a finished (done:) task was treated as all-paused"
+  printf 'working: compiling\n' > "$state/d.status"
+  ! signal_crew_declared_paused "$state/d.turn-ended" \
+    || fail "a working: task's bare turn-end was treated as all-paused"
+  ! signal_crew_declared_paused "$state/a.meta" \
+    || fail "a non-signal file resolved to an all-paused verdict"
+  ! signal_crew_declared_paused \
+    || fail "an empty signal file list was treated as all-paused"
+  pass "signal_crew_declared_paused: all-paused only when every referenced task's CURRENT last line is paused:"
+}
+
 # --- benign wakes are absorbed ONLY when the crew is provably working ---------
 
 test_provably_working_signal_absorbed() {
@@ -391,6 +419,134 @@ test_turn_ended_provably_working_absorbed() {
   [ ! -s "$state/.wake-queue" ] || fail "provably-working turn-end enqueued a durable wake record"
   reap "$pid"
   pass "a bare turn-end whose crew is provably working (busy pane) is absorbed"
+}
+
+# --- benign wakes are ALSO absorbed when the crew's CURRENT last line is a
+#     declared pause (paused:), the SIGNAL-path counterpart of the STALE path's
+#     existing declared-pause absorb (see
+#     test_nonterminal_stale_paused_absorbed_then_resurfaced). Filed against the
+#     captain's direct complaint that firstmate still burns a turn to say
+#     "shipshape" every few minutes while a crew waits on its own no-mistakes
+#     run: such a crew is not provably working by crew_absorb_class (no active
+#     run-step, no busy pane), so before this fix every status append and
+#     turn-end touch surfaced. FM_FAKE_CREW_STATE is left at the fake's unknown
+#     default (NOT provably working) throughout, so these cases exercise the
+#     NEW absorb class on its own, not the existing provably-working one.
+
+test_signal_declared_paused_absorbed() {
+  local dir state fakebin out status_file pid
+  dir=$(make_case signal-declared-paused-absorbed); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  status_file="$state/task.status"
+  printf 'paused: holding for the upstream release\n' > "$status_file"
+  # Explicit unknown verdict: never provably working, so this exercises the
+  # NEW declared-pause absorb class on its own, regardless of what an earlier
+  # test in this file left FM_FAKE_CREW_STATE exported to.
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake default'
+  export FM_PAUSE_RESURFACE_SECS=999
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher exited for a fresh declared-pause signal (should absorb): $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "declared-pause signal printed a wake reason: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "declared-pause signal enqueued a durable wake record"
+  [ -s "$state/.seen-task_status" ] || fail "declared-pause signal did not advance its .seen-* suppressor"
+  [ ! -e "$state/.paused-signal-resurfaced-task" ] || fail "a fresh (not-yet-due) declared pause touched the resurface marker"
+  reap "$pid"
+  unset FM_PAUSE_RESURFACE_SECS
+  pass "a no-verb signal whose crew's last line is a declared pause is absorbed, exactly like provably-working"
+}
+
+test_signal_declared_paused_resurfaced() {
+  local dir state fakebin out drain_out status_file pid back
+  dir=$(make_case signal-declared-paused-resurfaced); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  status_file="$state/task.status"
+  printf 'paused: holding for the upstream release\n' > "$status_file"
+  # Backdate the status file well past a short resurface window so the very
+  # first poll finds the pause already due for its bounded recheck (no prior
+  # .paused-signal-resurfaced-task marker means age_of reports it as overdue too).
+  back=$(( $(date +%s) - 500 ))
+  if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$status_file"
+  else touch -m -d "@$back" "$status_file"; fi
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake default'
+  export FM_PAUSE_RESURFACE_SECS=240
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not re-surface a declared-pause signal past the threshold"
+  grep -F "signal: $status_file" "$out" >/dev/null || fail "re-surface did not print the signal wake"
+  grep -F "declared pause" "$out" >/dev/null || fail "re-surface was not labeled a declared-pause recheck"
+  grep -F "possible wedge" "$out" >/dev/null && fail "a signal-path declared pause was mislabeled a possible wedge"
+  [ -e "$state/.paused-signal-resurfaced-task" ] || fail "the signal-path paused re-surface throttle marker was not recorded"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the signal-path paused re-surface failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "signal-path paused re-surface was not queued"
+  unset FM_PAUSE_RESURFACE_SECS
+  pass "a signal-path declared pause is re-surfaced once past PAUSE_RESURFACE_SECS, never mislabeled a wedge"
+}
+
+# Guarantee: a terminal verb ALWAYS surfaces even if a pause preceded it - the
+# whole point of absorb-only-when-provably-working is that a swallowed finish is
+# the worst failure, and this absorb class must not weaken that.
+test_signal_terminal_after_pause_always_surfaces() {
+  local dir state fakebin out drain_out status_file pid
+  dir=$(make_case signal-terminal-after-pause); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  status_file="$state/task.status"
+  printf 'paused: holding for the upstream release\ndone: shipped once the release landed\n' > "$status_file"
+  export FM_PAUSE_RESURFACE_SECS=999
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not surface a done: signal that a pause had preceded"
+  grep -F "signal: $status_file" "$out" >/dev/null || fail "watcher did not print the surfaced done: signal"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the done-after-pause signal failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "done-after-pause signal was not queued"
+  unset FM_PAUSE_RESURFACE_SECS
+  pass "a terminal verb surfaces even when a declared pause precedes it (a swallowed finish is never absorbed)"
+}
+
+# Guarantee: away mode still queues every wake, even a declared pause.
+test_signal_declared_paused_afk_still_queues() {
+  local dir state fakebin out drain_out status_file pid
+  dir=$(make_case signal-declared-paused-afk); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  status_file="$state/task.status"
+  printf 'paused: holding for the upstream release\n' > "$status_file"
+  : > "$state/.afk"
+  export FM_PAUSE_RESURFACE_SECS=999
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "away mode did not queue a declared-pause signal"
+  grep -F "signal: $status_file" "$out" >/dev/null || fail "away mode did not print the declared-pause signal reason"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the away-mode declared-pause signal failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "away-mode declared-pause signal was not queued"
+  unset FM_PAUSE_RESURFACE_SECS
+  pass "away mode still queues a declared-pause signal instead of absorbing it"
+}
+
+# Guarantee: a crew that appends working: after a pause returns to normal
+# classification immediately - the last line is no longer paused:, so this must
+# fall through to the ordinary provably-working test rather than staying
+# paused-absorbed.
+test_signal_working_after_pause_returns_to_normal() {
+  local dir state fakebin out drain_out status_file pid
+  dir=$(make_case signal-working-after-pause); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  status_file="$state/task.status"
+  printf 'paused: holding for the upstream release\nworking: release landed, resuming\n' > "$status_file"
+  # Explicit unknown verdict (NOT provably working): a genuinely idle crew that
+  # merely wrote working: must surface, exactly as
+  # test_working_note_not_working_surfaced already asserts for a crew with no
+  # pause history.
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake default'
+  export FM_PAUSE_RESURFACE_SECS=999
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "a working: note after a pause was left absorbed instead of returning to normal classification"
+  grep -F "signal: $status_file" "$out" >/dev/null || fail "watcher did not print the surfaced post-pause working: signal"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the post-pause working: signal failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "post-pause working: signal was not queued"
+  unset FM_PAUSE_RESURFACE_SECS
+  pass "a working: note appended after a pause returns to normal (provably-working) classification immediately"
 }
 
 # --- a no-verb signal whose crew is NOT provably working SURFACES -------------
@@ -2125,8 +2281,14 @@ test_crew_is_provably_working_classifier
 test_status_is_paused_classifier
 test_crew_absorb_class_classifier
 test_signal_crew_provably_working_classifier
+test_signal_crew_declared_paused_classifier
 test_provably_working_signal_absorbed
 test_turn_ended_provably_working_absorbed
+test_signal_declared_paused_absorbed
+test_signal_declared_paused_resurfaced
+test_signal_terminal_after_pause_always_surfaces
+test_signal_declared_paused_afk_still_queues
+test_signal_working_after_pause_returns_to_normal
 test_turn_ended_not_working_surfaced
 test_working_note_not_working_surfaced
 test_actionable_signal_surfaced

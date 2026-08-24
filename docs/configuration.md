@@ -306,6 +306,15 @@ The locked bootstrap inheritance pass uses the same per-home changed-set and rer
 That live discovery starts from `state/*.meta` records with `kind=secondmate`; `data/secondmates.md` only backfills `home=` for older or incomplete meta records.
 Skipped items, such as a destination checkout that does not yet gitignore the item, are visible warnings but not hard failures.
 
+## Watcher cadence tuning (config/watch.env)
+
+`config/watch.env` is an optional, local, gitignored shell file (covered by the blanket `config/` `.gitignore` entry, alongside every other local config item in this doc) that a home may use to tune `bin/fm-watch.sh` cadence knobs without editing tracked code.
+`bin/fm-claude-stop-autoarm.sh` sources it, when present, before sourcing `config/x-mode.env`, so an X-mode home's generated cadence still wins over any general tuning in `watch.env`.
+A missing file is silently skipped; a malformed or unreadable file fails only the bad line inside it, never the arming hook itself, since the hook runs under `set -u` without `set -e`.
+`FM_SIGNAL_GRACE` (default `30`, seconds) is the primary knob: it is the grace period `bin/fm-watch.sh`'s signal path lingers after a status or turn-end file changes before classifying the wake, so a crewmate's final status write and the same turn's turn-end hook land inside one coalesced wake instead of two.
+Because every actionable wake costs firstmate a full supervision turn, raising `FM_SIGNAL_GRACE` directly reduces how many turns a busy fleet's trailing signal bursts cost, at the price of added latency before an actionable wake is queued.
+Like `config/x-mode.env`, `bin/fm-watch.sh` reads this cadence only at process start, so a change is applied by restarting the home-scoped watcher.
+
 ## X mode (.env)
 
 X mode lets a firstmate instance answer public `@myfirstmate` mentions and act on normal reversible mention requests through firstmate's normal lifecycle.
