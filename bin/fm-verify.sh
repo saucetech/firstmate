@@ -1135,6 +1135,7 @@ run_build_with_timeout() {
     $live_escaped_descendants = sub {
       ($processes, $snapshot_error) = $snapshot->();
       return (undef, $snapshot_error) unless defined($processes);
+      $escaped_max_age = time - $runner_started + 3;
       %live_escaped_pid = ();
       for $candidate (keys %{$processes}) {
         next if $candidate == $$ || $candidate == $pid;
@@ -1146,6 +1147,16 @@ run_build_with_timeout() {
           next;
         }
         next unless exists($escaped_groups{$entry->{pgid}});
+        # A member of a group this build entered was created by this build, so
+        # it cannot be older than the runner. Age is what the group half has
+        # instead of a tracked identity: without it the only thing separating a
+        # host process that was already running from a false accusation is
+        # %baseline_start, and that is a SINGLE snapshot - a sample, which this
+        # file assumes elsewhere can omit a process that is provably alive. One
+        # baseline miss would then refuse a good verification, strand the build
+        # worktree and send an operator after a stranger. Same bound the
+        # unaccounted-lineage scan puts on the same question.
+        next unless $entry->{elapsed} <= $escaped_max_age;
         # Same number, different group leader: a group this build never entered.
         $escaped_group_identity = $escaped_groups{$entry->{pgid}};
         next if $escaped_group_identity ne ""

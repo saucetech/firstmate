@@ -1168,6 +1168,12 @@ PL
 # accepts mid-window corroboration from one that intersects the closing sample
 # with the opening suspects alone.
 #
+# FM_VERIFY_TEST_ELAPSED is the age every projected row reports. A process the
+# build created is younger than the runner that started it, so that is what the
+# fixture projects by default; an age older than the run projects the other
+# thing that can wear a remembered group number - a host process that was
+# already running before this build began.
+#
 # The projected pids are taken from above the highest number this platform can
 # assign as a pid, so nothing here can ever name - and the drain can never aim a
 # signal at - a real process on the host.
@@ -1179,10 +1185,12 @@ printf '%s\n' "$output"
 [ -s "$FM_VERIFY_TEST_LEADER" ] || exit 0
 leader=$(cat "$FM_VERIFY_TEST_LEADER")
 if kill -0 "$leader" 2>/dev/null; then
-  printf '%s 1 %s %s S 10:00 %s\n' \
-    "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID" "$FM_VERIFY_TEST_OBSERVED_START"
-  printf '%s %s %s %s S 10:00 %s\n' \
-    "$FM_VERIFY_TEST_ESCAPEE" "$leader" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID" "$FM_VERIFY_TEST_OBSERVED_START"
+  printf '%s 1 %s %s S %s %s\n' \
+    "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID" \
+    "$FM_VERIFY_TEST_ELAPSED" "$FM_VERIFY_TEST_OBSERVED_START"
+  printf '%s %s %s %s S %s %s\n' \
+    "$FM_VERIFY_TEST_ESCAPEE" "$leader" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID" \
+    "$FM_VERIFY_TEST_ELAPSED" "$FM_VERIFY_TEST_OBSERVED_START"
   printf 'observed\n' >> "$FM_VERIFY_TEST_MARK"
 else
   printf 'drained\n' >> "$FM_VERIFY_TEST_DRAIN_MARK"
@@ -1191,16 +1199,17 @@ else
     exit 0
   fi
   if [ -n "$FM_VERIFY_TEST_HANDOFF_SAMPLE" ] && [ "$drain_samples" -ge "$FM_VERIFY_TEST_HANDOFF_SAMPLE" ]; then
-    printf '%s 1 %s %s S 10:00 Tue Jan  2 00:00:02 2001\n' \
-      "$FM_VERIFY_TEST_SUCCESSOR" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID"
+    printf '%s 1 %s %s S %s Tue Jan  2 00:00:02 2001\n' \
+      "$FM_VERIFY_TEST_SUCCESSOR" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID" "$FM_VERIFY_TEST_ELAPSED"
     exit 0
   fi
   if [ -z "$FM_VERIFY_TEST_GROUP_SAMPLES" ] \
      || [ "$drain_samples" -le "$FM_VERIFY_TEST_GROUP_SAMPLES" ]; then
-    printf '%s 1 %s %s S 10:00 %s\n' \
-      "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID" "$FM_VERIFY_TEST_DRAIN_START"
-    printf '%s 1 %s %s S 10:00 Tue Jan  2 00:00:00 2001\n' \
-      "$FM_VERIFY_TEST_MEMBER" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID"
+    printf '%s 1 %s %s S %s %s\n' \
+      "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID" \
+      "$FM_VERIFY_TEST_ELAPSED" "$FM_VERIFY_TEST_DRAIN_START"
+    printf '%s 1 %s %s S %s Tue Jan  2 00:00:00 2001\n' \
+      "$FM_VERIFY_TEST_MEMBER" "$FM_VERIFY_TEST_GROUP" "$FM_VERIFY_TEST_UID" "$FM_VERIFY_TEST_ELAPSED"
   fi
 fi
 SH
@@ -1239,16 +1248,24 @@ ESCAPED_GROUP_SETTLE_BLINK=17
 # early enough that mid-window samples corroborate the successor before the
 # closing sample rules on it.
 ESCAPED_GROUP_SETTLE_HANDOFF=17
+# The age of a process this build created, which is what every escapee the check
+# exists to catch actually is: younger than the runner, and comfortably younger
+# than a fixture run that lasts a couple of seconds.
+ESCAPED_GROUP_ELAPSED='00:01'
+# The age of a process that was already running when the runner started. No
+# descendant of this build can report it.
+ESCAPED_GROUP_STALE_ELAPSED='10:00'
 
-# run_escaped_group_fixture <slug> <drain-leader-start> [group-samples] [blink-sample] [handoff-sample]:
+# run_escaped_group_fixture <slug> <drain-leader-start> [group-samples] [blink-sample] [handoff-sample] [elapsed]:
 # one verification whose build escapes into the projected group and leaves members
 # of it behind - running for good, or for that many drain-phase samples,
-# optionally missing from the one drain-phase sample named by blink-sample, and
+# optionally missing from the one drain-phase sample named by blink-sample,
 # optionally handed off to the successor from the drain-phase sample named by
-# handoff-sample onward.
+# handoff-sample onward, and reporting elapsed as their age.
 # ESCAPED_GROUP_DRAIN_MARK holds one line per drain-phase sample of the run.
 run_escaped_group_fixture() {
-  local slug=$1 drain_start=$2 group_samples=${3:-} blink_sample=${4:-} handoff_sample=${5:-} fake_ps leader mark
+  local slug=$1 drain_start=$2 group_samples=${3:-} blink_sample=${4:-} handoff_sample=${5:-} \
+    elapsed=${6:-$ESCAPED_GROUP_ELAPSED} fake_ps leader mark
   new_fixture "$slug"
   fake_ps="$FIX_TMP/escaped-group-ps"
   leader="$FIX_TMP/build-leader.pid"
@@ -1268,6 +1285,7 @@ run_escaped_group_fixture() {
     FM_VERIFY_TEST_MEMBER="$ESCAPED_GROUP_MEMBER_PID" \
     FM_VERIFY_TEST_OBSERVED_START="$ESCAPED_GROUP_OBSERVED_START" \
     FM_VERIFY_TEST_DRAIN_START="$drain_start" \
+    FM_VERIFY_TEST_ELAPSED="$elapsed" \
     FM_VERIFY_TEST_DRAIN_MARK="$ESCAPED_GROUP_DRAIN_MARK" \
     FM_VERIFY_TEST_GROUP_SAMPLES="$group_samples" \
     FM_VERIFY_TEST_BLINK_SAMPLE="$blink_sample" \
@@ -1337,6 +1355,30 @@ test_reused_process_group_number_is_not_this_builds_leak() {
     "a stranger wearing a remembered group number must not be reported as a leak"
   [ -s "$FIX_SPAWN_LOG" ] || fail "the verification must reach the verifier spawn"
   pass "fm-verify: a reused process group number is not this build's leak"
+}
+
+test_process_older_than_the_run_is_not_this_builds_leak() {
+  # The same shape again, with the group still led by the process the build
+  # escaped into, so the identity binding cannot be what settles this. What is
+  # different is the age of the live processes wearing that number: they were
+  # already running when the runner started, which no descendant of this build
+  # can have been. Membership in a remembered group is a lead, not a verdict,
+  # and a lead that points at a process older than the build points somewhere
+  # else - at a host process that the one baseline snapshot happened to miss, or
+  # at a number a wrapped pid counter handed out twice. Convicting it refuses a
+  # good verification, strands the build worktree and sends whoever reads the
+  # refusal after a stranger, which is the false-positive class this whole check
+  # was rewritten to stop producing.
+  run_escaped_group_fixture escaped-group-predates-run "$ESCAPED_GROUP_OBSERVED_START" \
+    "" "" "" "$ESCAPED_GROUP_STALE_ELAPSED"
+  expect_code 0 "$VERIFY_RC" \
+    "a process older than the run must not fail the build (got: $VERIFY_OUT)"
+  assert_not_contains "$VERIFY_OUT" "because build drain was not confirmed" \
+    "a process that predates the runner must not be reported as this build's leak"
+  assert_not_contains "$VERIFY_OUT" "$ESCAPED_GROUP_MEMBER_PID" \
+    "a process that predates the runner must not be named as still running"
+  [ -s "$FIX_SPAWN_LOG" ] || fail "the verification must reach the verifier spawn"
+  pass "fm-verify: a process older than the run is not this build's leak"
 }
 
 test_escaped_group_member_that_exits_during_the_settle_is_not_a_leak() {
@@ -2041,6 +2083,7 @@ test_build_descendant_left_alive_after_drain_fails_closed
 test_cleanly_exited_own_process_group_children_are_not_a_leak
 test_live_member_of_an_escaped_group_fails_closed
 test_reused_process_group_number_is_not_this_builds_leak
+test_process_older_than_the_run_is_not_this_builds_leak
 test_escaped_group_member_that_exits_during_the_settle_is_not_a_leak
 test_escaped_group_handoff_to_a_new_member_fails_closed
 test_build_descendant_closing_lineage_fails_closed
