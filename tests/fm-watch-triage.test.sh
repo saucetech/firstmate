@@ -70,6 +70,21 @@ wait_log_count() {  # <file> <pattern> <count> [limit]
   return 1
 }
 
+# Wait up to <limit> 0.1s ticks until <file> is non-empty. An absorbed wake
+# writes its .seen-* suppressor (and any absorb-class marker) only at the END of
+# the classification, after a full poll interval plus FM_SIGNAL_GRACE plus a
+# crew-state read, so asserting on those files the instant wait_live's liveness
+# window closes races the watcher rather than testing it.
+wait_file_nonempty() {  # <file> [limit]
+  local file=$1 limit=${2:-100} i=0
+  while [ "$i" -lt "$limit" ]; do
+    [ -s "$file" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
 wait_numeric_file() {
   local file=$1 limit=${2:-30} i=0 value
   while [ "$i" -lt "$limit" ]; do
@@ -395,9 +410,10 @@ test_provably_working_signal_absorbed() {
   if ! wait_live "$pid" 30; then
     reap "$pid"; fail "watcher exited for a working: signal whose crew is provably working (should absorb): $(cat "$out")"
   fi
+  wait_file_nonempty "$state/.seen-task_status" \
+    || fail "provably-working signal did not advance its .seen-* suppressor"
   [ ! -s "$out" ] || fail "provably-working signal printed a wake reason: $(cat "$out")"
   [ ! -s "$state/.wake-queue" ] || fail "provably-working signal enqueued a durable wake record"
-  [ -s "$state/.seen-task_status" ] || fail "provably-working signal did not advance its .seen-* suppressor"
   [ -e "$state/.last-watcher-beat" ] || fail "watcher beacon was not touched while absorbing"
   reap "$pid"
   pass "a no-verb signal whose crew is provably working is absorbed (no exit, no queue, suppressor advanced, beacon present)"
@@ -448,9 +464,11 @@ test_signal_declared_paused_absorbed() {
   if ! wait_live "$pid" 30; then
     reap "$pid"; fail "watcher exited for a fresh declared-pause signal (should absorb): $(cat "$out")"
   fi
+  wait_file_nonempty "$state/.seen-task_status" \
+    || fail "declared-pause signal did not advance its .seen-* suppressor"
   [ ! -s "$out" ] || fail "declared-pause signal printed a wake reason: $(cat "$out")"
   [ ! -s "$state/.wake-queue" ] || fail "declared-pause signal enqueued a durable wake record"
-  [ -s "$state/.seen-task_status" ] || fail "declared-pause signal did not advance its .seen-* suppressor"
+  [ -s "$state/.paused-signal-since-task" ] || fail "the declared-pause episode-start anchor was not planted on the first absorb"
   [ ! -e "$state/.paused-signal-resurfaced-task" ] || fail "a fresh (not-yet-due) declared pause touched the resurface marker"
   reap "$pid"
   unset FM_PAUSE_RESURFACE_SECS
@@ -463,17 +481,18 @@ test_signal_declared_paused_resurfaced() {
   out="$dir/watch.out"; drain_out="$dir/drain.out"
   status_file="$state/task.status"
   printf 'paused: holding for the upstream release\n' > "$status_file"
-  # Backdate the status file well past a short resurface window so the very
-  # first poll finds the pause already due for its bounded recheck (no prior
-  # .paused-signal-resurfaced-task marker means age_of reports it as overdue too).
+  # Plant an episode-start anchor dated well past a short resurface window, so
+  # the very first poll finds the pause already due for its bounded recheck (no
+  # prior .paused-signal-resurfaced-task marker means age_of reports it overdue
+  # too). The anchor, not the status file's mtime, is what the cadence measures.
   back=$(( $(date +%s) - 500 ))
-  if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$status_file"
-  else touch -m -d "@$back" "$status_file"; fi
+  printf '%s' "$back" > "$state/.paused-signal-since-task"
+  set_mtime "$back" "$state/.paused-signal-since-task"
   export FM_FAKE_CREW_STATE='state: unknown · source: none · fake default'
   export FM_PAUSE_RESURFACE_SECS=240
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
-  wait_for_exit "$pid" 40 || fail "watcher did not re-surface a declared-pause signal past the threshold"
+  wait_for_exit "$pid" 100 || fail "watcher did not re-surface a declared-pause signal past the threshold"
   grep -F "signal: $status_file" "$out" >/dev/null || fail "re-surface did not print the signal wake"
   grep -F "declared pause" "$out" >/dev/null || fail "re-surface was not labeled a declared-pause recheck"
   grep -F "possible wedge" "$out" >/dev/null && fail "a signal-path declared pause was mislabeled a possible wedge"
@@ -482,6 +501,65 @@ test_signal_declared_paused_resurfaced() {
   grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "signal-path paused re-surface was not queued"
   unset FM_PAUSE_RESURFACE_SECS
   pass "a signal-path declared pause is re-surfaced once past PAUSE_RESURFACE_SECS, never mislabeled a wedge"
+}
+
+# Regression: a crew that periodically re-appends the SAME ongoing pause line
+# ("paused: still waiting on the vendor") must NOT be able to suppress the
+# bounded recheck forever. Every such append is itself absorbed by the new
+# declared-pause class, so anchoring the cadence on the status file's mtime
+# would reset the age on every append and the recheck would never come due.
+# The cadence is anchored on .paused-signal-since-<task> instead - wall-clock
+# time since the pause episode began - so a freshly rewritten status file with
+# an old episode anchor is still due.
+test_signal_declared_paused_reappend_still_resurfaces() {
+  local dir state fakebin out drain_out status_file pid back
+  dir=$(make_case signal-declared-paused-reappend); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  status_file="$state/task.status"
+  # An old pause episode whose status file was JUST re-appended: mtime is now,
+  # so the old mtime-anchored cadence would report "not due" indefinitely.
+  back=$(( $(date +%s) - 500 ))
+  printf '%s' "$back" > "$state/.paused-signal-since-task"
+  set_mtime "$back" "$state/.paused-signal-since-task"
+  printf 'paused: waiting on the vendor\npaused: still waiting on the vendor\n' > "$status_file"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake default'
+  export FM_PAUSE_RESURFACE_SECS=240
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 || fail "a re-appended pause line suppressed the bounded recheck (cadence still anchored on status mtime)"
+  grep -F "signal: $status_file" "$out" >/dev/null || fail "the reappend-immune recheck did not print the signal wake"
+  grep -F "declared pause" "$out" >/dev/null || fail "the reappend-immune recheck was not labeled a declared-pause recheck"
+  [ -e "$state/.paused-signal-resurfaced-task" ] || fail "the reappend-immune recheck did not record its throttle marker"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the reappend-immune recheck failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "the reappend-immune recheck was not queued"
+  unset FM_PAUSE_RESURFACE_SECS
+  pass "a repeatedly re-appended pause line cannot suppress the bounded signal-path recheck"
+}
+
+# The signal-path pause markers are task-keyed, so clear_pause_state (window-keyed,
+# stale path) never retires them. signal_pause_clear_resolved does, on EVERY signal
+# wake and before any absorb branching - asserted here on the earliest branch of
+# all, a terminal verb, which never reaches the declared-pause branch. A leftover
+# episode anchor would otherwise make the NEXT pause on that task look ancient and
+# re-surface immediately.
+test_signal_pause_markers_cleared_when_pause_resolves() {
+  local dir state fakebin out status_file pid back
+  dir=$(make_case signal-pause-markers-cleared); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  status_file="$state/task.status"
+  back=$(( $(date +%s) - 500 ))
+  printf '%s' "$back" > "$state/.paused-signal-since-task"
+  printf '%s' "$back" > "$state/.paused-signal-resurfaced-task"
+  printf 'paused: holding for the upstream release\ndone: the release landed and shipped\n' > "$status_file"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake default'
+  export FM_PAUSE_RESURFACE_SECS=999
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 || fail "watcher did not surface the terminal verb that resolved the pause"
+  [ ! -e "$state/.paused-signal-since-task" ] || fail "the signal-path pause episode anchor outlived the pause it tracked"
+  [ ! -e "$state/.paused-signal-resurfaced-task" ] || fail "the signal-path pause resurface throttle outlived the pause it tracked"
+  unset FM_PAUSE_RESURFACE_SECS
+  pass "signal-path pause markers are retired as soon as the task's last line leaves the pause"
 }
 
 # Guarantee: a terminal verb ALWAYS surfaces even if a pause preceded it - the
@@ -496,7 +574,7 @@ test_signal_terminal_after_pause_always_surfaces() {
   export FM_PAUSE_RESURFACE_SECS=999
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
-  wait_for_exit "$pid" 40 || fail "watcher did not surface a done: signal that a pause had preceded"
+  wait_for_exit "$pid" 100 || fail "watcher did not surface a done: signal that a pause had preceded"
   grep -F "signal: $status_file" "$out" >/dev/null || fail "watcher did not print the surfaced done: signal"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the done-after-pause signal failed"
   grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "done-after-pause signal was not queued"
@@ -515,7 +593,7 @@ test_signal_declared_paused_afk_still_queues() {
   export FM_PAUSE_RESURFACE_SECS=999
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
-  wait_for_exit "$pid" 40 || fail "away mode did not queue a declared-pause signal"
+  wait_for_exit "$pid" 100 || fail "away mode did not queue a declared-pause signal"
   grep -F "signal: $status_file" "$out" >/dev/null || fail "away mode did not print the declared-pause signal reason"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the away-mode declared-pause signal failed"
   grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "away-mode declared-pause signal was not queued"
@@ -541,7 +619,7 @@ test_signal_working_after_pause_returns_to_normal() {
   export FM_PAUSE_RESURFACE_SECS=999
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
-  wait_for_exit "$pid" 40 || fail "a working: note after a pause was left absorbed instead of returning to normal classification"
+  wait_for_exit "$pid" 100 || fail "a working: note after a pause was left absorbed instead of returning to normal classification"
   grep -F "signal: $status_file" "$out" >/dev/null || fail "watcher did not print the surfaced post-pause working: signal"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the post-pause working: signal failed"
   grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "post-pause working: signal was not queued"
@@ -2286,6 +2364,8 @@ test_provably_working_signal_absorbed
 test_turn_ended_provably_working_absorbed
 test_signal_declared_paused_absorbed
 test_signal_declared_paused_resurfaced
+test_signal_declared_paused_reappend_still_resurfaces
+test_signal_pause_markers_cleared_when_pause_resolves
 test_signal_terminal_after_pause_always_surfaces
 test_signal_declared_paused_afk_still_queues
 test_signal_working_after_pause_returns_to_normal

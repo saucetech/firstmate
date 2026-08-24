@@ -7,13 +7,28 @@
 # actively-running no-mistakes step, or a backend busy signal), and surfaced
 # otherwise, so a crew that finishes (or stops and waits) without a current
 # working signal is never silently swallowed. A declared external-wait pause is
-# the separate idle absorb case and re-surfaces only on its long bounded cadence,
-# although its initial no-verb status signal still surfaces in normal mode.
+# the separate idle absorb case, and it now applies to BOTH paths alike: a
+# no-verb wake whose referenced tasks ALL carry a declared pause (paused:) as
+# their CURRENT last status line is absorbed exactly like a provably-working
+# wake, and re-surfaces only on the long bounded PAUSE_RESURFACE_SECS cadence
+# (signal path: signal_crew_declared_paused + signal_pause_resurface_due; stale
+# path: handle_paused_stale). So a paused crew's status appends and turn-end
+# touches cost no firstmate turn, and no single append is guaranteed a look; the
+# bounded cadence, measured from when the pause episode began rather than from
+# the last status write, is the guarantee that a forgotten pause cannot rot
+# invisibly. A terminal verb appended after a pause still surfaces at once,
+# because classification reads only the current last line - as does a working:
+# note, which returns the task to ordinary provably-working classification.
 # While state/.afk exists, the daemon owns triage and this watcher queues and exits
 # on every wake. Printed reason lines:
 #   signal: <file>...      status/turn-end signals, surfaced when a listed status
 #                          has a captain-relevant verb OR a no-verb signal's crew
-#                          is not provably working, unless afk is active
+#                          is neither provably working nor declared paused,
+#                          unless afk is active. A no-verb signal whose tasks are
+#                          ALL declared paused is absorbed, and re-surfaces on the
+#                          PAUSE_RESURFACE_SECS cadence with a trailing
+#                          "(declared pause, rechecked on a long cadence not a
+#                          wedge; ...)" note - never as a wedge
 #   stale: <window>        a provably-working stale is ALWAYS absorbed (with a wedge
 #                          timer) regardless of what the status log says - an active
 #                          run-step or busy pane outranks even a captain-relevant log
@@ -131,10 +146,14 @@ SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trai
 # / stale path is absorb-only-when-provably-working: such a wake is absorbed ONLY
 # while the crew shows positive evidence it is still working (an actively-running
 # no-mistakes step, or a busy pane, via crew_is_provably_working over
-# fm-crew-state.sh); a crew that stopped its turn with no running pipeline and no
-# busy pane is SURFACED, so a finish reported only through interactive pane menus
+# fm-crew-state.sh), or while every referenced task declares an external-wait
+# pause on its current last status line (the separate idle absorb class described
+# in the file header, bounded on both paths by PAUSE_RESURFACE_SECS); a crew that
+# stopped its turn with no running pipeline, no busy pane and no declared pause is
+# SURFACED, so a finish reported only through interactive pane menus
 # (no done: status) is never swallowed. An ACTIONABLE wake (a captain-relevant
-# signal, a no-verb signal whose crew is not provably working, any check, a stale
+# signal, a no-verb signal whose crew is neither provably working nor declared
+# paused, a declared pause due for its bounded recheck, any check, a stale
 # pane whose crew is not provably working, a provably-working stale past the
 # threshold, or anything unknown) is written to the durable queue and exits, which
 # is what wakes the LLM through the background-task completion. The same classifier
@@ -393,38 +412,62 @@ handle_paused_stale() {  # <window> <task> <hash>
 # Bounded recheck for a no-verb signal wake absorbed only because
 # signal_crew_declared_paused reports every referenced task paused: fires once
 # per PAUSE_RESURFACE_SECS per task so a forgotten pause on the signal path
-# cannot rot invisibly, mirroring handle_paused_stale's cadence. Keyed by task
-# id (.paused-signal-resurfaced-<task>) rather than a window key, since the
-# signal path classifies before the stale loop below resolves any window.
-# Anchored on each task's status file mtime, exactly like the stale path, so a
-# churny status write cannot itself reset the age (only a genuinely new status
-# append ages the cadence, and a paused wake caused by such an append is itself
-# a legitimate recheck). Touches the marker ONLY for a task it reports due,
-# the same single-touch discipline as handle_paused_stale.
+# cannot rot invisibly. Keyed by task id rather than a window key, since the
+# signal path classifies before the stale loop below resolves any window, and
+# anchored on a dedicated per-task episode-start marker,
+# $STATE/.paused-signal-since-<task>, written once when this function first sees
+# that task's pause absorbed and never rewritten while the pause holds. The
+# anchor is deliberately NOT the status file's mtime: on this path every pause
+# append is itself absorbed, so a crew that periodically re-appends the SAME
+# ongoing pause ("paused: still waiting on the vendor") would reset an mtime
+# anchor on every append and the recheck would never come due. Wall-clock time
+# since the pause episode began is immune to that churn. The
+# .paused-signal-resurfaced-<task> throttle records the last recheck so the
+# cadence repeats once per window rather than every poll, and is written ONLY
+# for a task this function reports due - the same single-touch discipline as
+# handle_paused_stale. Both markers are dropped by signal_pause_clear_resolved
+# as soon as the task's last status line leaves the pause.
 signal_pause_resurface_due() {  # <file> ...
-  local f dir base task seen="" statusf age rf rf_age result=1
-  for f in "$@"; do
-    dir=${f%/*}
-    base=${f##*/}
-    case "$base" in
-      *.status)     task=${base%.status} ;;
-      *.turn-ended) task=${base%.turn-ended} ;;
-      *)            continue ;;
-    esac
+  local dir task seen=0 since since_age rf rf_age result=1
+  while IFS=$(printf '\t') read -r dir task; do
     [ -n "$task" ] || continue
-    case " $seen " in *" $task "*) continue ;; esac
-    seen="$seen $task"
-    statusf="$dir/$task.status"
-    age=$(age_of "$statusf")
-    rf="$dir/.paused-signal-resurfaced-$task"
-    rf_age=$(age_of "$rf")
-    if [ "$age" -ge "$PAUSE_RESURFACE_SECS" ] && [ "$rf_age" -ge "$PAUSE_RESURFACE_SECS" ]; then
+    seen=1
+    since="$STATE/.paused-signal-since-$task"
+    [ -e "$since" ] || date +%s > "$since"
+    since_age=$(age_of "$since")
+    rf="$STATE/.paused-signal-resurfaced-$task"
+    rf_age=$(age_of "$rf")   # 999999 when no prior re-surface
+    if [ "$since_age" -ge "$PAUSE_RESURFACE_SECS" ] && [ "$rf_age" -ge "$PAUSE_RESURFACE_SECS" ]; then
       date +%s > "$rf"
       result=0
     fi
-  done
-  [ -n "$seen" ] || return 1
+  done <<EOF
+$(signal_tasks_of "$@")
+EOF
+  [ "$seen" -eq 1 ] || return 1
   return "$result"
+}
+
+# Drop the signal-path pause-episode markers for every task referenced by a
+# signal wake whose CURRENT last status line is no longer a declared pause, so
+# the next pause on that task starts a fresh PAUSE_RESURFACE_SECS episode and no
+# marker outlives the pause it tracks. Called unconditionally on every signal
+# wake, before the absorb classification branches, so a task that leaves a pause
+# is cleaned up whichever branch that wake takes (terminal verb, afk,
+# provably-working, or surfaced). This is the task-keyed counterpart of what
+# clear_pause_state does for the stale path's window-keyed markers; the two
+# tracking schemes are separate and neither cleans up the other's files.
+signal_pause_clear_resolved() {  # <file> ...
+  local dir task last
+  while IFS=$(printf '\t') read -r dir task; do
+    [ -n "$task" ] || continue
+    last=$(last_status_line "$dir/$task.status")
+    status_is_paused "$last" && continue
+    rm -f "$STATE/.paused-signal-since-$task" "$STATE/.paused-signal-resurfaced-$task"
+  done <<EOF
+$(signal_tasks_of "$@")
+EOF
+  return 0
 }
 
 clear_pause_state() {  # <window>
@@ -979,8 +1022,13 @@ EOF
     # earlier pause, and a crew that appends working: after a pause reads as
     # neither actionable nor paused here, so it falls through to the ordinary
     # provably-working test. The provably-working check is the only costly one
-    # (it may run a bounded no-mistakes call), so the || ordering evaluates it
-    # ONLY for a non-afk, no-captain-verb signal.
+    # (it may run a bounded no-mistakes call), so the branch ordering evaluates
+    # it ONLY for a non-afk, no-captain-verb signal.
+    # signal_pause_clear_resolved runs first and unconditionally: it is a cheap
+    # status-line read that retires the pause-episode markers of any referenced
+    # task that has left its pause, whichever branch this wake then takes.
+    # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
+    signal_pause_clear_resolved $files
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
     if afk_present || signal_reason_is_actionable $files; then
       surface_signal=1
