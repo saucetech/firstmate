@@ -461,7 +461,7 @@ runner_result_matches_exit() {
       case "$expected" in ''|*[!0-9]*) return 1 ;; esac
       expected=$((128 + expected))
       ;;
-    drained:timeout:*|drained:error:*|undrained:pids=*|undrained:lineage=*) expected=125 ;;
+    drained:timeout:*|drained:error:*|undrained:pids=*|undrained:lineage=*|undrained:escaped=*) expected=125 ;;
     *) return 1 ;;
   esac
   case "$expected" in ''|*[!0-9]*) return 1 ;; esac
@@ -472,6 +472,7 @@ runner_result_survivors() {
   case "$1" in
     undrained:pids=*) printf '%s\n' "${1#undrained:pids=}" ;;
     undrained:lineage=*) printf '%s\n' "${1#undrained:lineage=}" ;;
+    undrained:escaped=*) printf '%s\n' "${1#undrained:escaped=}" ;;
     *) printf '%s\n' unknown ;;
   esac
 }
@@ -862,7 +863,8 @@ run_build_with_timeout() {
     $lineage_scanned = 0;
     $lineage_scan_rounds = 0;
     %tracked_start = ();
-    %escaped_seen = ();
+    %escaped_start = ();
+    %escaped_groups = ();
     %baseline_start = ();
     $reap_leader = sub {
       return 1 if $leader_reaped;
@@ -946,6 +948,37 @@ run_build_with_timeout() {
       return "lsof-exit:$lineage_lsof_status" unless $lineage_lsof_status == 0 || $lineage_lsof_status == 1;
       return "";
     };
+    # A remembered process group is a lead back to this build only for as long as
+    # the number still names the same group. Pid numbers wrap, so each group is
+    # bound to the identity of its leader, exactly the way a tracked pid is bound
+    # to the start time of the process that holds it. Without that binding a long
+    # build hands the drain check a bare number, and an unrelated process that has
+    # since become the leader of a group with that number is reported as a leak of
+    # this build - a confident false accusation from the check whose whole job is
+    # to be trustworthy about containment.
+    #
+    # An identity that cannot be read stays unknown, and unknown fails closed:
+    # the number cannot be handed out again while the group still has members, so
+    # a live member with no visible leader is far more likely to be an escape of
+    # this build than a coincidence, and the cost of being wrong the other way is
+    # a host process left running behind a green verification.
+    $remember_escaped_group = sub {
+      $escaped_group = shift;
+      $escaped_group_leader = exists($processes->{$escaped_group})
+        ? $processes->{$escaped_group}->{start}
+        : "";
+      if (!exists($escaped_groups{$escaped_group})) {
+        $escaped_groups{$escaped_group} = $escaped_group_leader;
+        return;
+      }
+      # A leader that has since exited erases nothing: it is the normal end of a
+      # group, not a change of identity. A leader that is a different process is
+      # the number changing hands mid-build, and neither group can be ruled out
+      # from then on.
+      return if $escaped_group_leader eq "";
+      return if $escaped_groups{$escaped_group} eq $escaped_group_leader;
+      $escaped_groups{$escaped_group} = "";
+    };
     $refresh_descendants = sub {
       ($processes, $snapshot_error) = $snapshot->();
       return (undef, $snapshot_error) unless defined($processes);
@@ -964,7 +997,8 @@ run_build_with_timeout() {
             next unless exists($processes->{$lineage_pid});
             $tracked_start{$lineage_pid} = $processes->{$lineage_pid}->{start};
             if ($lineage_pid != $pid && $processes->{$lineage_pid}->{pgid} != $pid) {
-              $escaped_seen{$lineage_pid} = $processes->{$lineage_pid}->{start};
+              $escaped_start{$lineage_pid} = $processes->{$lineage_pid}->{start};
+              $remember_escaped_group->($processes->{$lineage_pid}->{pgid});
             }
           }
         }
@@ -991,7 +1025,8 @@ run_build_with_timeout() {
             $changed = 1;
           }
           if ($candidate != $pid && $entry->{pgid} != $pid) {
-            $escaped_seen{$candidate} = $entry->{start};
+            $escaped_start{$candidate} = $entry->{start};
+            $remember_escaped_group->($entry->{pgid});
           }
         }
       }
@@ -1068,6 +1103,118 @@ run_build_with_timeout() {
       return (undef, "lsof-exit:$cwd_lsof_status") unless $cwd_lsof_status == 0 || $cwd_lsof_status == 1;
       @unaccounted = keys %unaccounted_pid;
       return (\@unaccounted, "");
+    };
+    # What containment actually owes the host: when the build is over, nothing it
+    # started may still be running. It does NOT owe the host a build whose
+    # toolchain never used a process group of its own - xcodebuild legitimately
+    # creates hundreds, and every one of them exits on its own.
+    #
+    # So an escape is a LEAD, not a verdict. Escaping the leader process group
+    # matters because kill on the leader group cannot reach that subtree, and a
+    # member of it that no snapshot ever caught is invisible to per-pid tracking
+    # too. Remembering which groups the build escaped into is what makes that
+    # subtree addressable at the end; the verdict itself is taken here, against
+    # fresh snapshots, and only processes that are STILL ALIVE count. What this
+    # sub returns is a set of suspects from one such snapshot - a set becomes a
+    # refusal only after $settle_live_escaped re-polls it.
+    #
+    # Both halves are load-bearing. The remembered-pid half catches an escape we
+    # tracked that outlived the drain. The group half catches the one per-pid
+    # tracking structurally cannot: a process whose ancestry back to the tracked
+    # set died before any snapshot saw it, so it is parented to init, and whose
+    # working directory is outside the build root, so the unaccounted-lineage
+    # scan does not claim it either. Its process group is the only thread back to
+    # the build, which is why the group is remembered rather than just counted -
+    # bound to the identity of its leader, so the number alone can never convict
+    # a stranger (see $remember_escaped_group).
+    #
+    # Do NOT restore the old test - refusing whenever %escaped_start is non-empty.
+    # It asserted history instead of liveness: it blocked every iOS verification
+    # in the fleet on hundreds of processes that had already exited, while a
+    # genuinely leaked process could still walk past it. Tests pin both directions.
+    $live_escaped_descendants = sub {
+      ($processes, $snapshot_error) = $snapshot->();
+      return (undef, $snapshot_error) unless defined($processes);
+      $escaped_max_age = time - $runner_started + 3;
+      %live_escaped_pid = ();
+      for $candidate (keys %{$processes}) {
+        next if $candidate == $$ || $candidate == $pid;
+        $entry = $processes->{$candidate};
+        next unless $entry->{uid} == $runner_uid;
+        next if $entry->{state} =~ /^Z/;
+        if (exists($escaped_start{$candidate}) && $escaped_start{$candidate} eq $entry->{start}) {
+          $live_escaped_pid{$candidate} = 1;
+          next;
+        }
+        next unless exists($escaped_groups{$entry->{pgid}});
+        # A member of a group this build entered was created by this build, so
+        # it cannot be older than the runner. Age is what the group half has
+        # instead of a tracked identity: without it the only thing separating a
+        # host process that was already running from a false accusation is
+        # %baseline_start, and that is a SINGLE snapshot - a sample, which this
+        # file assumes elsewhere can omit a process that is provably alive. One
+        # baseline miss would then refuse a good verification, strand the build
+        # worktree and send an operator after a stranger. Same bound the
+        # unaccounted-lineage scan puts on the same question.
+        next unless $entry->{elapsed} <= $escaped_max_age;
+        # Same number, different group leader: a group this build never entered.
+        $escaped_group_identity = $escaped_groups{$entry->{pgid}};
+        next if $escaped_group_identity ne ""
+          && exists($processes->{$entry->{pgid}})
+          && $processes->{$entry->{pgid}}->{start} ne $escaped_group_identity;
+        next if exists($baseline_start{$candidate}) && $baseline_start{$candidate} eq $entry->{start};
+        $live_escaped_pid{$candidate} = 1;
+      }
+      @live_escaped = keys %live_escaped_pid;
+      return (\@live_escaped, "");
+    };
+    # A snapshot is a SAMPLE of the process table, so one of them cannot carry a
+    # verdict about liveness on its own - the same reason the readiness gate below
+    # re-observes, and the same reason the drain re-polls tracked pids on a graded
+    # budget before it calls any of them survivors. The first non-empty result
+    # here is therefore a set of SUSPECTS, not a leak: a toolchain helper whose
+    # ancestry back to the tracked set died between samples can be milliseconds
+    # from exiting when it is caught, and convicting it refuses a good
+    # verification, strands the build worktree, and sends whoever reads the
+    # refusal after a process that has already gone.
+    #
+    # So re-sample on the cadence $wait_all_gone uses, let the window run out,
+    # and refuse on the pids the CLOSING sample reports that any earlier
+    # observation - the suspect set or a mid-window sample - also reported. Only
+    # the closing sample convicts: an intermediate one that omits a suspect is
+    # the same unreliable observation this window exists to absorb, so it is
+    # inconclusive rather than an acquittal - treating it as one would let a
+    # single miss on a loaded host clear a real leak and hand the build a green
+    # verification with a host process still running behind it, which is the
+    # worse of the two errors. Corroboration cuts both ways: a leaked process
+    # that hands its escaped group off to a child and exits mid-window leaves a
+    # successor the samples it spans have seen, so the closing sample still
+    # convicts it, while a late helper only the closing sample ever catches
+    # keeps the single-sample grace this window exists to give. This costs a
+    # normal build nothing - it runs only once a suspect exists - and softens
+    # nothing: a genuinely leaked process is still running when a window this
+    # short closes, which is what makes it a leak. A snapshot that cannot be
+    # taken stays an error, exactly as it is outside the window. Do not collapse
+    # this back to a single sample, do not let an intermediate sample retire a
+    # suspect, and do not judge the closing sample against the opening suspects
+    # alone.
+    $settle_live_escaped = sub {
+      $settle_suspects = shift;
+      $settle_attempts = shift;
+      # Copied before the first re-poll on purpose: the suspect list aliases the
+      # array $live_escaped_descendants rebuilds on every call.
+      %settle_seen_pid = map { $_ => 1 } @{$settle_suspects};
+      # Seeded with the suspects so a window that closes without ever sampling
+      # refuses rather than acquits, the same way every other ambiguity here does.
+      @settle_survivors = keys %settle_seen_pid;
+      for (1 .. $settle_attempts) {
+        select undef, undef, undef, 0.05;
+        ($settle_live, $settle_error) = $live_escaped_descendants->();
+        return (undef, $settle_error) unless defined($settle_live);
+        @settle_survivors = grep { exists($settle_seen_pid{$_}) } @{$settle_live};
+        $settle_seen_pid{$_} = 1 for @{$settle_live};
+      }
+      return (\@settle_survivors, "");
     };
     $terminate_all = sub {
       ($live, $refresh_error) = $refresh_descendants->();
@@ -1211,9 +1358,21 @@ run_build_with_timeout() {
       $publish->("undrained:lineage=" . join(",", sort { $a <=> $b } @{$unaccounted})) or exit 125;
       exit 125;
     }
-    if (keys %escaped_seen) {
-      $escaped = join(",", sort { $a <=> $b } keys %escaped_seen);
-      $publish->("drained:error:escaped-descendants:$escaped") or exit 125;
+    ($live_escaped, $escaped_error) = $live_escaped_descendants->();
+    if (!defined($live_escaped)) {
+      $publish->("undrained:pids=$escaped_error") or exit 125;
+      exit 125;
+    }
+    if (@{$live_escaped}) {
+      # Same budget the drain gives tracked pids after TERM: 20 polls at 0.05s.
+      ($live_escaped, $escaped_error) = $settle_live_escaped->($live_escaped, 20);
+      if (!defined($live_escaped)) {
+        $publish->("undrained:pids=$escaped_error") or exit 125;
+        exit 125;
+      }
+    }
+    if (@{$live_escaped}) {
+      $publish->("undrained:escaped=" . join(",", sort { $a <=> $b } @{$live_escaped})) or exit 125;
       exit 125;
     }
     $status = $leader_status;
@@ -1420,6 +1579,11 @@ case "$RUNNER_RESULT" in
   undrained:lineage=*)
     cleanup_build_worktree || true
     echo "BLOCKED: build lineage continuity was lost for surviving pids ${RUNNER_RESULT#undrained:lineage=}; no product verdict was recorded" >&2
+    exit 1
+    ;;
+  undrained:escaped=*)
+    cleanup_build_worktree || true
+    echo "BLOCKED: the build left processes running in process groups it escaped into: ${RUNNER_RESULT#undrained:escaped=}; no product verdict was recorded" >&2
     exit 1
     ;;
   *) RUNNER_RESULT=invalid ;;
