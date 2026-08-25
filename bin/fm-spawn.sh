@@ -111,8 +111,11 @@
 #   be outside every project clone, the active firstmate home, and the firstmate repo.
 #   Before a secondmate launch, the home is locally fast-forwarded to the primary
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
-#   Ship/scout spawns refuse to launch unless the resolved task path is a real
-#   git worktree root distinct from the primary project checkout.
+#   Ship/scout spawns refuse to launch unless the resolved task path is a git
+#   worktree root lying outside the primary project checkout, the firstmate code
+#   root, and the operational home, decided by device+inode identity rather than
+#   by path text; an unresolved worktree refuses too. docs/architecture.md
+#   "Worktrees, not branches in your checkout" owns that contract.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -347,6 +350,7 @@ HERDR_PROJECTION_ABORT_TASK_PANE=
 HERDR_PROJECTION_ABORT_SEEDED_PANE=
 HERDR_PRESENTATION_ORDER_LOCK=
 HERDR_PRESENTATION_ORDER_LOCK_HELD=0
+SPAWN_ENDPOINT_ABORT_CLEANUP=0
 SPAWN_TASK_LOCK=
 SPAWN_TASK_LOCK_HELD=0
 CONFIG_INHERIT_LOCK=
@@ -380,6 +384,12 @@ spawn_abort_cleanup() {
   fi
   if [ "$HERDR_PROJECTION_ABORT_CLEANUP" = 1 ]; then
     HERDR_PROJECTION_ABORT_CLEANUP=0
+    # A projected task pane IS this spawn's endpoint, and this exact-id cleanup
+    # owns removing it, under the presentation lock held right here. Leaving the
+    # endpoint kill below armed would close the same pane a second time after
+    # that lock is released, so a concurrent spawn's own create/close could
+    # interleave with this one's teardown.
+    SPAWN_ENDPOINT_ABORT_CLEANUP=0
     fm_backend_herdr_projection_cleanup_exact \
       "$HERDR_PROJECTION_ABORT_SESSION" \
       "$HERDR_PROJECTION_ABORT_TASK_PANE" \
@@ -416,6 +426,14 @@ spawn_abort_cleanup() {
         fi
       fi
     fi
+  fi
+  # Armed only across the isolation window (endpoint created, launch not yet
+  # asserted safe). Removing the endpoint there is the whole point: a refused
+  # spawn must not leave a live pane sitting in the primary checkout, which is
+  # exactly the state the 2026-08-19 and 2026-08-24 incidents ran in.
+  if [ "$SPAWN_ENDPOINT_ABORT_CLEANUP" = 1 ]; then
+    SPAWN_ENDPOINT_ABORT_CLEANUP=0
+    fm_backend_kill "$BACKEND" "$T" "${ZELLIJ_TAB_ID:-}" "$W" 2>/dev/null || true
   fi
   if [ "$SPAWN_TASK_LOCK_HELD" = 1 ]; then
     SPAWN_TASK_LOCK_HELD=0
@@ -770,15 +788,31 @@ resolve_project_dir_arg() {
   esac
 }
 
-path_is_ancestor_of() {
-  local ancestor=$1 path=$2
-  [ -n "$ancestor" ] || return 1
-  [ -n "$path" ] || return 1
-  [ "$ancestor" != "$path" ] || return 1
-  case "$path" in
-    "$ancestor"/*) return 0 ;;
-  esac
-  return 1
+# A directory's true on-disk absolute path.
+#
+# Bash's `pwd -P` builtin normalizes $PWD textually: it resolves symlink
+# components but never re-reads a directory's real on-disk spelling, so on a
+# case-insensitive volume a mis-cased argument survives it unchanged
+# (`cd /users/x && pwd -P` stays lowercase; zsh's builtin does normalize, which
+# is why this is invisible from an interactive zsh shell). The external pwd(1)
+# answers from getcwd(3), which the kernel fills in with the true spelling, and
+# that is the same form every backend's own current-path read reports (tmux's
+# pane_current_path, herdr's foreground_cwd, zellij/cmux's active pwd probe).
+# `env` forces the binary, since a bare `pwd` would hit the builtin again. The
+# result is used only when it is still the same directory, so a missing or
+# surprising pwd(1) degrades to the builtin spelling rather than silently
+# renaming a path; every comparison is identity-based, so that degradation
+# costs pool-key stability, never isolation safety.
+physical_dir() {  # <dir> -> canonical absolute path
+  local dir=$1 logical physical
+  logical=$(CDPATH='' cd -- "$dir" 2>/dev/null && pwd -P) || return 1
+  [ -n "$logical" ] || return 1
+  physical=$(CDPATH='' cd -- "$dir" 2>/dev/null && env pwd -P 2>/dev/null) || physical=
+  if [ -n "$physical" ] && [ -d "$physical" ] && [ "$physical" -ef "$logical" ]; then
+    printf '%s\n' "$physical"
+  else
+    printf '%s\n' "$logical"
+  fi
 }
 
 validate_firstmate_home_for_spawn() {
@@ -786,31 +820,31 @@ validate_firstmate_home_for_spawn() {
   abs_home=$(resolved_existing_dir "$home") || return 1
   abs_active_home=$(resolved_existing_dir "$FM_HOME")
   abs_root=$(resolved_existing_dir "$FM_ROOT")
-  if [ "$abs_home" = "/" ]; then
+  if fm_path_is_same_dir "$abs_home" /; then
     echo "error: secondmate home cannot be the filesystem root: $home" >&2
     return 1
   fi
-  if [ "$abs_home" = "$abs_active_home" ]; then
+  if fm_path_is_same_dir "$abs_home" "$abs_active_home"; then
     echo "error: secondmate home cannot be the active firstmate home: $home" >&2
     return 1
   fi
-  if [ "$abs_home" = "$abs_root" ]; then
+  if fm_path_is_same_dir "$abs_home" "$abs_root"; then
     echo "error: secondmate home cannot be the firstmate repo: $home" >&2
     return 1
   fi
-  if path_is_ancestor_of "$abs_active_home" "$abs_home"; then
+  if fm_path_is_same_or_descendant_by_identity "$abs_home" "$abs_active_home"; then
     echo "error: secondmate home cannot be inside the active firstmate home: $home" >&2
     return 1
   fi
-  if path_is_ancestor_of "$abs_root" "$abs_home"; then
+  if fm_path_is_same_or_descendant_by_identity "$abs_home" "$abs_root"; then
     echo "error: secondmate home cannot be inside the firstmate repo: $home" >&2
     return 1
   fi
-  if path_is_ancestor_of "$abs_home" "$abs_active_home"; then
+  if fm_path_is_same_or_descendant_by_identity "$abs_active_home" "$abs_home"; then
     echo "error: secondmate home cannot be an ancestor of the active firstmate home: $home" >&2
     return 1
   fi
-  if path_is_ancestor_of "$abs_home" "$abs_root"; then
+  if fm_path_is_same_or_descendant_by_identity "$abs_root" "$abs_home"; then
     echo "error: secondmate home cannot be an ancestor of the firstmate repo: $home" >&2
     return 1
   fi
@@ -849,17 +883,20 @@ validate_firstmate_operational_dirs() {
       echo "error: secondmate $name path is not a directory: $dir" >&2
       return 1
     else
-      abs_dir="$abs_home/$name"
+      # Not created yet, so it can only ever appear at "$abs_home/$name": there
+      # is no resolved directory to take an identity from, and none to escape.
+      continue
     fi
-    if ! path_is_ancestor_of "$abs_home" "$abs_dir"; then
+    if fm_path_is_same_dir "$abs_dir" "$abs_home" \
+       || ! fm_path_is_same_or_descendant_by_identity "$abs_dir" "$abs_home"; then
       echo "error: secondmate $name directory must resolve inside the secondmate home: $dir" >&2
       return 1
     fi
-    if [ "$abs_dir" = "$abs_active_home" ] || path_is_ancestor_of "$abs_active_home" "$abs_dir"; then
+    if fm_path_is_same_or_descendant_by_identity "$abs_dir" "$abs_active_home"; then
       echo "error: secondmate $name directory cannot be inside the active firstmate home: $dir" >&2
       return 1
     fi
-    if [ "$abs_dir" = "$abs_root" ] || path_is_ancestor_of "$abs_root" "$abs_dir"; then
+    if fm_path_is_same_or_descendant_by_identity "$abs_dir" "$abs_root"; then
       echo "error: secondmate $name directory cannot be inside the firstmate repo: $dir" >&2
       return 1
     fi
@@ -929,7 +966,16 @@ if [ "$KIND" = secondmate ]; then
     BRIEF="$DATA/$ID/brief.md"
   fi
 else
-  PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
+  # Canonicalized once, here, before anything derives from it. The pane is
+  # created with this path as its cwd, so `treehouse get` derives its pool key
+  # from it: the same repo reached by two spellings would otherwise lease
+  # worktrees from two different pools. Canonical is also the only form that
+  # can be compared against a backend's own current-path read as text, though
+  # nothing downstream relies on that - see fm_path_is_same_dir.
+  PROJ_ABS=$(physical_dir "$(resolve_project_dir_arg "$PROJ")") || {
+    echo "error: project directory cannot be resolved: $PROJ" >&2
+    exit 1
+  }
   if [ "$NEUTRAL_SET" -eq 1 ]; then
     WT=$(CDPATH='' cd -- "$NEUTRAL_DIR" 2>/dev/null && pwd -P) || {
       echo "error: neutral launch directory cannot be resolved: $NEUTRAL_DIR" >&2
@@ -979,27 +1025,6 @@ fi
 BRIEF_DIR_REAL=$(cd "$(dirname "$BRIEF")" && pwd -P)
 BRIEF_REAL="$BRIEF_DIR_REAL/$(basename "$BRIEF")"
 
-# PROJ_ABS can still carry a symlinked path component (e.g. macOS's /tmp ->
-# /private/tmp) when it came from the ship/scout branch's logical `pwd` above.
-# Every backend's own current-path read (tmux's pane_current_path, herdr's
-# foreground_cwd, zellij/cmux's active pwd probe against the live shell) can
-# report the OS-level, physically-resolved cwd, so comparing it against a
-# still-symlinked PROJ_ABS can misfire both ways: false-negative (the poll
-# below never notices the pane left the project) or false-positive (the
-# isolation guard refuses a spawn that never actually tangled). Canonicalize
-# once here so every downstream comparison uses the same physical form
-# (docs/herdr-backend.md "Known gaps").
-PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_ABS"
-
-real_path_or_raw() {  # <path>
-  local path=$1 real
-  if real=$(cd "$path" 2>/dev/null && pwd -P); then
-    printf '%s\n' "$real"
-  else
-    printf '%s\n' "$path"
-  fi
-}
-
 validate_neutral_launch_directory() {
   [ -d "$WT" ] || { echo "error: neutral launch directory is not a directory: $WT" >&2; return 1; }
   [ ! -L "$WT" ] || { echo "error: neutral launch directory must not be a symlink: $WT" >&2; return 1; }
@@ -1035,22 +1060,70 @@ TASK_CWD=$PROJ_ABS
 # herdr-sm-spaces-k4). Both branches converge on the same $T ("target") string
 # that every downstream operation (send/capture/kill) already treats as opaque
 # per-backend routing (fm_backend_resolve_selector).
+
+# The spawn's isolation assertion, and the last thing that runs before any side
+# effect: the per-task temp root, the turn-end hook, and the meta record all
+# follow it, because the 2026-08-04 stray hook landed in the primary checkout
+# when an installation ran ahead of this check.
+#
+# Two different relationships get decided in the spawn path, and conflating them
+# is what let this guard miss the hazard it exists for:
+#   - "the pane moved on from the project" is progress, decided by the settle
+#     loop below. A worktree is SUPPOSED to be a different directory, so a
+#     difference there is the expected outcome, not a danger signal.
+#   - "the launch directory is genuinely outside the primary checkout" is the
+#     safety property, decided here. The primary checkout itself and everything
+#     underneath it are the hazard, however either path happens to be spelled.
+# Both use device+inode identity (fm_path_is_same_dir,
+# fm_path_is_same_or_descendant_by_identity), so a mis-cased or symlinked
+# spelling can neither manufacture a difference nor hide one, and an
+# unresolvable path fails closed rather than passing as plausible.
 validate_spawn_worktree() {  # <source> <inspect-target>
-  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
-  wt_real=
-  if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
-    wt_real=
+  local source=$1 inspect_target=$2 wt_top reason=
+  if [ -z "$WT" ] || [ ! -d "$WT" ]; then
+    reason="it does not resolve to a directory"
+  else
+    wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null || true)
+    if [ -z "$wt_top" ] || ! fm_path_is_same_dir "$WT" "$wt_top"; then
+      reason="it is not the top level of a git worktree"
+    elif fm_path_is_same_or_descendant_by_identity "$WT" "$PROJ_ABS"; then
+      reason="it is the primary checkout, or lives inside it"
+    elif fm_path_is_same_or_descendant_by_identity "$WT" "$FM_ROOT"; then
+      reason="it lives inside firstmate's own code root"
+    elif fm_path_is_same_or_descendant_by_identity "$WT" "$FM_HOME"; then
+      reason="it lives inside firstmate's operational home"
+    fi
   fi
-  proj_real=$PROJ_ABS_REAL
-  wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null || true)
-  wt_top_real=
-  if ! wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P); then
-    wt_top_real=
-  fi
-  if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
-    echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
+  [ -z "$reason" ] || {
+    echo "error: $source did not yield an isolated worktree - $reason (resolved '${WT:-none}'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout.$(spawn_refusal_endpoint_hint "$inspect_target")" >&2
     exit 1
+  }
+}
+
+# What an operator can still look at after a refusal, which depends on whether
+# the endpoint outlives it. Inside the isolation window the abort trap removes
+# the endpoint on the way out, so pointing at it would name a window that is
+# guaranteed to be gone and take the only record of how the wrong directory was
+# reached with it; fold that record into the message instead. Outside the window
+# (the orca call site) the endpoint survives, so the inspect hint is the useful
+# answer and stays.
+#
+# One target decides both what is read and what the message names, so the two can
+# never drift apart. Callers inside the isolation window pass the same
+# rename-safe handle the worktree-detection polls use ($WT_TARGET, tmux's stable
+# window id): a name-form tmux read whose window name was lost falls back to the
+# active client's window, which here would splice the captain's own pane into a
+# refusal on stderr. Every other backend addresses an explicit pane id, for which
+# $WT_TARGET is already $T.
+spawn_refusal_endpoint_hint() {  # <endpoint-target>
+  local target=$1 pane
+  if [ "$SPAWN_ENDPOINT_ABORT_CLEANUP" != 1 ]; then
+    printf ' Inspect target %s' "$target"
+    return 0
   fi
+  pane=$(fm_backend_capture "$BACKEND" "$target" 120 "${W:-}" 2>/dev/null || true)
+  [ -n "$pane" ] || return 0
+  printf ' Last output from %s before it was removed:\n%s' "$target" "$pane"
 }
 
 herdr_projection_meta_field_exact() {  # <meta> <key>
@@ -1451,6 +1524,11 @@ kimi_spawn_fail() {  # <detail>
 }
 
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$NEUTRAL_SET" -eq 0 ]; then
+  # Everything from here to the isolation assertion is the window in which the
+  # endpoint exists but the launch is not yet committed to being safe. Any exit
+  # inside it removes the endpoint, so a refusal never leaves a live pane parked
+  # in the primary checkout for someone to type into.
+  SPAWN_ENDPOINT_ABORT_CLEANUP=1
   spawn_send_text_line "$WT_TARGET" 'treehouse get'
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
@@ -1458,47 +1536,90 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$NEUTRAL_SET" -eq 0
   # automatic-rename slips through), display-message -t <bad-name> falls back to the
   # active client's window, which would misread firstmate's OWN pane path as the
   # worktree and tangle a hook into the primary checkout. The window id never lies.
-  # Compare against PROJ_ABS_REAL (physical), not PROJ_ABS: a symlinked project
-  # prefix would otherwise make the pane's OS-level cwd read differ from
-  # PROJ_ABS on the very first poll, before the pane has actually moved.
   #
-  # A single read that already differs from PROJ_ABS_REAL is not proof the pane
-  # settled there: on some tmux/WSL setups a brand-new window's pane_current_path
-  # transiently reports an unrelated stale path (seen live as another real git
-  # checkout entirely) before the shell catches up with treehouse get's cd. That
-  # stale path still passes the PROJ_ABS_REAL comparison and validate_spawn_worktree
-  # below (it resolves to a real, distinct worktree top-level too), so accepting it
-  # on one read alone silently records the wrong worktree= in state/<id>.meta. Require
-  # two consecutive reads to agree on the same non-project path before accepting it;
-  # a mismatch just becomes the new candidate rather than resetting the wait, so a
-  # pane that is already settled by the first real read only costs the one existing
-  # inter-poll sleep as confirmation, not a whole extra cycle on top.
+  # "Has the pane moved on from the project yet?" is decided by device+inode
+  # identity (fm_path_is_same_dir), never by comparing path strings. A backend
+  # reports the pane's real cwd, so it names the directory in its true on-disk
+  # spelling; a project path typed in any other case, or reached through a
+  # symlink, can therefore never string-match that read. The loop then concluded
+  # on its FIRST poll that the pane had already left, and recorded the PRIMARY
+  # CHECKOUT as the worktree - which the old string-equality guard accepted,
+  # because a project clone is a genuine git top level distinct from the
+  # mis-spelled string it was compared against. The confirmation below could not
+  # catch it either: the wrong value was stable, so it agreed with itself
+  # immediately.
+  #
+  # A single read that already differs from the project is still not proof the
+  # pane settled there: on some tmux/WSL setups a brand-new window's
+  # pane_current_path transiently reports an unrelated stale path (seen live as
+  # another real git checkout entirely) before the shell catches up with
+  # treehouse get's cd. That stale path is a real, distinct worktree top level
+  # too, so accepting it on one read alone silently records the wrong worktree=
+  # in state/<id>.meta. Require two consecutive reads to agree on the same
+  # non-project directory before accepting it; a mismatch just becomes the new
+  # candidate rather than resetting the wait, so a pane that is already settled
+  # by the first real read only costs the one existing inter-poll sleep as
+  # confirmation, not a whole extra cycle on top.
+  #
+  # WT stays genuinely empty until a confirmed pair lands, so the bounded wait
+  # below can actually expire, and an expiry is a refusal rather than a guess.
+  wt_polls=${FM_SPAWN_WORKTREE_POLLS:-60}
+  wt_poll_interval=${FM_SPAWN_WORKTREE_POLL_INTERVAL:-1}
   candidate=""
-  for _ in $(seq 1 60); do
+  settled_in_project=0
+  for _ in $(seq 1 "$wt_polls"); do
     p=$(spawn_current_path "$WT_TARGET" || true)
-    if [ -n "$p" ]; then
-      p_real=$(real_path_or_raw "$p")
-      if [ "$p_real" != "$PROJ_ABS_REAL" ]; then
-        if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
-          WT="$p"
-          break
-        fi
-        candidate="$p_real"
-      else
-        candidate=""
-      fi
-    else
+    if [ -z "$p" ] || [ ! -d "$p" ]; then
       candidate=""
+      settled_in_project=0
+    elif fm_path_is_same_dir "$p" "$PROJ_ABS"; then
+      candidate=""
+      settled_in_project=1
+    elif [ -n "$candidate" ] && fm_path_is_same_dir "$p" "$candidate"; then
+      WT="$p"
+      break
+    else
+      candidate="$p"
+      settled_in_project=0
     fi
-    sleep 1
+    sleep "$wt_poll_interval"
   done
   if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
+    if [ "$settled_in_project" -eq 1 ]; then
+      # Confirmed unsafe: the pane is sitting in the primary checkout, so the
+      # endpoint goes with the refusal and its output comes along in the message.
+      echo "error: the worker never left the primary checkout ($PROJ_ABS) within the ${wt_polls}-poll wait; refusing to launch to avoid tangling it. Check that treehouse get can lease a worktree for this project.$(spawn_refusal_endpoint_hint "${WT_TARGET:-$T}")" >&2
+    else
+      # Nothing unsafe has been established: the pane never resolved anywhere,
+      # so `treehouse get` may still be in flight. Killing the shell running it
+      # is what abandons a half-created pool slot or leaves an owner_pid naming
+      # a dead process, so the endpoint is left alone and stays inspectable.
+      SPAWN_ENDPOINT_ABORT_CLEANUP=0
+      echo "error: treehouse get did not settle in a worktree within the ${wt_polls}-poll wait; refusing to launch rather than accept an unresolved worktree. Inspect window $T" >&2
+    fi
     exit 1
   fi
 
-  validate_spawn_worktree "treehouse get" "$T"
+  validate_spawn_worktree "treehouse get" "${WT_TARGET:-$T}"
 fi
+
+# Defence in depth, independent of the isolation assertion above, and like it
+# ahead of every side effect: a turn-end hook is a file written into the agent's
+# OWN directory, so writing one into firstmate's code root or operational home
+# arms it on firstmate's own session. Every firstmate turn then wakes the
+# watcher for a task that does not exist, which presents as unexplained wake
+# churn rather than as an error - the 2026-08-04 failure, which cost about forty
+# minutes of hunting a "phantom waker" firstmate was generating itself. Refuse
+# the write outright, so no future path can reintroduce it quietly.
+if [ "$KIND" != secondmate ]; then
+  if fm_path_is_same_dir "$WT" "$FM_ROOT" || fm_path_is_same_dir "$WT" "$FM_HOME"; then
+    echo "error: refusing to install a turn-end hook into firstmate's own tree ('$WT'); a worker must run in an isolated worktree.$(spawn_refusal_endpoint_hint "${WT_TARGET:-$T}")" >&2
+    exit 1
+  fi
+fi
+# Every isolation refusal is behind us, so the endpoint is committed to and the
+# abort trap stops removing it.
+SPAWN_ENDPOINT_ABORT_CLEANUP=0
 
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
 # create GOTMPDIR, so mkdir before it is used; fm-teardown removes the whole root.

@@ -871,8 +871,9 @@ run_spawn_case() {  # <bin-root> <fakebin> <log> <state> <data> <config> <proj> 
 # directory as "the worktree" and tripping its false isolation refusal.
 # make_spawn_symlink_fakebin's tmux stub returns an unmoved project path on the
 # first pane_current_path poll, then the real worktree path from the second poll
-# onward, so this test fails loudly if the PROJ_ABS/PROJ_ABS_REAL
-# canonicalization in bin/fm-spawn.sh ever regresses.
+# onward, so this test fails loudly if bin/fm-spawn.sh's physical_dir project
+# canonicalization or its fm_path_is_same_dir identity comparison ever
+# regresses.
 make_spawn_symlink_fakebin() {  # <dir> <initial-project-path> <worktree-path> -> echoes fakebin dir
   local dir=$1 initial_path=$2 wt=$3 fb="$1/fakebin" counter="$1/poll-count"
   mkdir -p "$fb"
@@ -913,9 +914,9 @@ run_spawn_symlink_case() {  # <label> <physical|logical>
   fm_git_worktree "$real_root/proj" "$wt" "fm/$id"
   # TMP_ROOT itself can already sit behind an OS-level symlink (e.g. macOS's
   # /var -> /private/var), so resolve the fakebin's "physical" reply with
-  # pwd -P rather than string concatenation - it must match exactly what
-  # fm-spawn.sh's own PROJ_ABS_REAL computes, including any symlink layers
-  # ABOVE this test's own synthetic real_root/link_root pair.
+  # pwd -P rather than string concatenation - it must name the same directory
+  # fm-spawn.sh's own physical_dir resolves PROJ_ABS to, including any symlink
+  # layers ABOVE this test's own synthetic real_root/link_root pair.
   proj_phys=$(cd "$real_root/proj" && pwd -P)
   case "$first_reply" in
     physical) initial_path=$proj_phys ;;
