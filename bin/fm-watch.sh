@@ -596,9 +596,9 @@ clear_pause_tracking() {  # <window>
 #                 NOT confirm as a safe absorb: the crew's agent is still live
 #                 (it may be sitting at an interactive decision gate the pause
 #                 line does not describe), or fm-crew-state read something other
-#                 than the declared wait. That disconfirming case gets exactly
-#                 ONE look per pause EPISODE and then falls onto the bounded
-#                 cadence - see below for why the episode, not the pane hash, is
+#                 than the declared wait. Reachable ONLY on an episode's FIRST
+#                 look, so the disconfirming look happens exactly once per pause
+#                 EPISODE - see below for why the episode, not the pane hash, is
 #                 the unit;
 #   none        - no declared pause or hold at all and no absorb class, so the
 #                 caller applies its ordinary non-terminal stale handling.
@@ -616,8 +616,15 @@ clear_pause_tracking() {  # <window>
 # stale is already on the bounded pause cadence": handle_paused_stale plants it on
 # an absorb and surface_nonterminal_stale plants it on a surface, so whichever way
 # the first look goes, every later poll of the same episode re-affirms `paused`
-# through the fast path regardless of how much the pane has churned. The episode
-# ends when the last status line stops declaring a wait (the stale loop clears the
+# regardless of how much the pane has churned. That holds through the cheap fast
+# path within a STALE_ESCALATE_SECS window and, once the window expires, through
+# the bounded authoritative re-read too: an ESTABLISHED episode settles on
+# `paused` for every class except `working`, so a wait the authoritative read can
+# never confirm - a `captain-held:` line, which fm-crew-state maps to `unknown`
+# and so to `none`, or a `paused:` line whose crew state reads momentarily
+# unreadable, stopped, done or parked - keeps the long PAUSE_RESURFACE_SECS
+# cadence instead of re-surfacing once per STALE_ESCALATE_SECS. The episode ends
+# when the last status line stops declaring a wait (the stale loop clears the
 # tracking) or when the periodic authoritative re-read reports `working`.
 # A confidently dead ordinary crew is the opposite case and still recovers
 # `paused` even when fm-crew-state has fallen back to stopped or unknown: its
@@ -658,7 +665,9 @@ pause_state_class() {  # <window> <task>
     [ -n "$agent_alive" ] || agent_alive=unknown
   fi
   [ "$class" = none ] && [ "$agent_alive" = dead ] && class=paused
-  if [ "$class" = paused ] && [ "$established" -eq 0 ]; then
+  # An established episode has already spent its one look, so anything short of
+  # `working` settles back onto the bounded cadence.
+  if [ "$established" -eq 0 ]; then
     date +%s > "$recheck_file"
     printf 'paused'
     return
@@ -1331,10 +1340,14 @@ EOF
           #     of wedge-escalating;
           #   - unconfirmed: a declared wait authoritative state does not confirm -
           #     typically a still-live agent that may be parked at an interactive
-          #     decision gate the pause line does not describe. Surface it ONCE, in
-          #     either arm; the surface plants the episode markers, so every later
-          #     poll of that episode re-affirms `paused` however much the pane
-          #     churns.
+          #     decision gate the pause line does not describe. Reported only on an
+          #     episode's FIRST look, so surfacing it, in either arm, is what plants
+          #     the episode markers; every later poll of that episode reports
+          #     `paused` instead - through the cheap fast path inside a window, and
+          #     through the authoritative re-read once the window expires - so an
+          #     established episode always settles on the bounded cadence however
+          #     much the pane churns and whatever the re-read reports short of
+          #     `working`.
           #   - none: no running pipeline, no exact busy verdict, no declared pause.
           #     Surface immediately so firstmate inspects the inconclusive state
           #     (it may be done via an interactive menu that wrote no done: status,
@@ -1369,12 +1382,10 @@ EOF
                          printf '%s' "$h" > "$sf"
                          wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
-                # The disconfirming look, taken at most once per episode: reached
-                # here only when this key has no established episode yet, or when
-                # the bounded STALE_ESCALATE_SECS re-read of an established one
-                # reported the wait no longer confirmed. Surfacing re-plants the
-                # episode markers, so the next poll re-affirms `paused` rather
-                # than re-appending this wake.
+                # The disconfirming look, taken exactly once per episode: reached
+                # here only when this key has no established episode yet.
+                # Surfacing plants the episode markers, so every later poll of
+                # this episode reports `paused` rather than re-appending this wake.
                 unconfirmed) surface_nonterminal_stale "$w" "$h" ;;
                 # `none` needs a declared wait to have gone away entirely, which
                 # the stale loop's own clear_pause_tracking already handles above;

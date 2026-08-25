@@ -1590,6 +1590,121 @@ test_live_declared_pause_looks_once_per_episode_not_per_hash() {
   pass "a live crew's declared pause gets ONE look per episode, absorbs every pane repaint after it, and still comes due for its bounded recheck"
 }
 
+# --- defect 1, follow-up: a declared wait the authoritative read can NEVER
+#     confirm keeps the SAME bounded cadence, not the short stale one ----------
+# `unconfirmed` is the surfacing class for a declared wait a live crew's
+# authoritative state does not confirm, and its unit is the pause EPISODE. Two
+# waits can never be confirmed at all, so without an episode guard they took that
+# surfacing look again on every STALE_ESCALATE_SECS window (roughly 15 wakes an
+# hour at the 240s default) where the pre-`unconfirmed` revision absorbed them on
+# the 3600s PAUSE_RESURFACE_SECS cadence (roughly one):
+#   (a) any `captain-held:` line - fm-crew-state.sh's map_log_state has no case
+#       for that verb, so it always reads `unknown` and crew_absorb_class always
+#       reports `none`; and
+#   (b) a `paused:` line whose crew state is momentarily unreadable, stopped,
+#       done or parked - the same fall-through for the same reason.
+# So this pins the INTERVAL, not just the absorb: STALE_ESCALATE_SECS and
+# PAUSE_RESURFACE_SECS are set far apart and the pane must stay absorbed across
+# the short one and come due exactly once on the long one.
+assert_unconfirmable_wait_keeps_pause_cadence() {  # <case> <task> <status-line> <crew-state>
+  local name=$1 task=$2 line=$3 crew=$4
+  local dir state fakebin out capture_file statusf window key pane_hash sig pid wakes back
+  dir=$(make_case "$name"); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/$task.status"
+  window="test:fm-$task"
+  printf 'idle under an unconfirmable wait\n' > "$capture_file"
+  # harness=grok + a grok foreground command is a LIVE agent, so the wait can
+  # never reach the confidently-dead recovery that maps it to `paused`.
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/$task.meta"
+  printf '%s\n' "$line" > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-${task}_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle under an unconfirmable wait")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  # Phase 1: the episode's one look, unchanged - a live gate under a wait
+  # nothing confirms is still surfaced once on first sight.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok FM_FAKE_CREW_STATE="$crew" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=30 FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; fail "$name: an unconfirmable wait did not get its one look"; }
+  [ -e "$state/.paused-$key" ] || fail "$name: the one look did not establish the pause episode"
+
+  # Phase 2: the bounded authoritative re-read actually runs (the recheck marker
+  # is aged well past FM_STALE_ESCALATE_SECS) and still cannot confirm the wait.
+  # The established episode must ABSORB anyway - this is the regression arm.
+  # Repeat once with the pane repainted, so both the repeat-poll arm and the
+  # first-sighting arm of the non-terminal stale dispatch are covered.
+  back=$(( $(date +%s) - 500 ))
+  set_mtime "$back" "$state/.paused-rechecked-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok FM_FAKE_CREW_STATE="$crew" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=30 FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  wait_live "$pid" 40 \
+    || { wait "$pid" 2>/dev/null || true; fail "$name: the bounded re-read of an established wait re-surfaced it on the short stale cadence: $(cat "$out")"; }
+  [ ! -e "$state/.stale-since-$key" ] || { reap "$pid"; fail "$name: an absorbed unconfirmable wait started the wedge timer"; }
+  reap "$pid"
+
+  printf 'idle under an unconfirmable wait (repainted)\n' > "$capture_file"
+  pane_hash=$(hash_text "idle under an unconfirmable wait (repainted)")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  set_mtime "$back" "$state/.paused-rechecked-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok FM_FAKE_CREW_STATE="$crew" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=30 FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  wait_live "$pid" 40 \
+    || { wait "$pid" 2>/dev/null || true; fail "$name: a repainted pane under an established unconfirmable wait re-opened the look: $(cat "$out")"; }
+  reap "$pid"
+  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")
+  [ "$wakes" -eq 1 ] \
+    || fail "$name: an unconfirmable wait cost $wakes wakes; the short stale cadence must not govern it"
+
+  # Phase 3: the LONG cadence is the one that governs. Age the wait and the
+  # re-surface throttle past FM_PAUSE_RESURFACE_SECS and it comes due exactly
+  # once, as a paused recheck - never as a wedge.
+  set_mtime "$back" "$statusf"
+  [ -e "$state/.paused-resurfaced-$key" ] || fail "$name: the one look did not record a re-surface throttle"
+  set_mtime "$back" "$state/.paused-resurfaced-$key"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-${task}_status"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok FM_FAKE_CREW_STATE="$crew" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=30 FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 \
+    || { reap "$pid"; fail "$name: an absorbed unconfirmable wait never came due on its bounded cadence"; }
+  grep -F "awaiting external" "$out" >/dev/null \
+    || fail "$name: the bounded recheck was not labeled a paused recheck: $(cat "$out")"
+  grep -F "possible wedge" "$out" >/dev/null \
+    && fail "$name: the bounded recheck was mislabeled a possible wedge: $(cat "$out")"
+  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")
+  [ "$wakes" -eq 2 ] \
+    || fail "$name: expected one look plus one bounded recheck, got $wakes wakes"
+}
+
+test_unconfirmable_declared_wait_keeps_the_bounded_cadence() {
+  assert_unconfirmable_wait_keeps_pause_cadence captain-held-live-agent held \
+    'captain-held [key=route]: tracked by held-decision-route' \
+    'state: unknown · source: none · no run step attributed'
+  assert_unconfirmable_wait_keeps_pause_cadence paused-unreadable-crew-state parked \
+    'paused: waiting on the vendor quota reset' \
+    'state: unknown · source: none · crew state unreadable'
+  pass "a declared wait authoritative state can never confirm stays on the long pause cadence, not the short stale one"
+}
+
 # Guarantee (1) on the stale path, restated against the newly-absorbing case: a
 # crew that finishes under a live agent must surface at once even though its
 # pause episode was already established and absorbing.
@@ -2790,6 +2905,7 @@ test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces
 test_live_declared_pause_looks_once_per_episode_not_per_hash
+test_unconfirmable_declared_wait_keeps_the_bounded_cadence
 test_terminal_after_established_pause_episode_still_surfaces
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_nonpaused_stale_remains_suppressed
