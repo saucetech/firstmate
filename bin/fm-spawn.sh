@@ -806,59 +806,36 @@ physical_dir() {  # <dir> -> canonical absolute path
   fi
 }
 
-# Do two paths name the same directory? Decided by device+inode identity, never
-# by comparing strings: a case-insensitive volume, a symlink prefix, a hard link
-# and a bind mount each name one directory two ways, and lowercasing is not a
-# substitute because it would false-positive on genuinely distinct paths on a
-# case-sensitive volume. Fails closed - a missing or unreadable path is never
-# reported as the same directory.
-same_dir() {  # <a> <b>
-  [ -n "$1" ] && [ -n "$2" ] || return 1
-  [ -d "$1" ] && [ -d "$2" ] || return 1
-  [ "$1" -ef "$2" ]
-}
-
-path_is_ancestor_of() {
-  local ancestor=$1 path=$2
-  [ -n "$ancestor" ] || return 1
-  [ -n "$path" ] || return 1
-  [ "$ancestor" != "$path" ] || return 1
-  case "$path" in
-    "$ancestor"/*) return 0 ;;
-  esac
-  return 1
-}
-
 validate_firstmate_home_for_spawn() {
   local id=$1 home=$2 abs_home abs_active_home abs_root marker_id
   abs_home=$(resolved_existing_dir "$home") || return 1
   abs_active_home=$(resolved_existing_dir "$FM_HOME")
   abs_root=$(resolved_existing_dir "$FM_ROOT")
-  if [ "$abs_home" = "/" ]; then
+  if fm_path_is_same_dir "$abs_home" /; then
     echo "error: secondmate home cannot be the filesystem root: $home" >&2
     return 1
   fi
-  if [ "$abs_home" = "$abs_active_home" ]; then
+  if fm_path_is_same_dir "$abs_home" "$abs_active_home"; then
     echo "error: secondmate home cannot be the active firstmate home: $home" >&2
     return 1
   fi
-  if [ "$abs_home" = "$abs_root" ]; then
+  if fm_path_is_same_dir "$abs_home" "$abs_root"; then
     echo "error: secondmate home cannot be the firstmate repo: $home" >&2
     return 1
   fi
-  if path_is_ancestor_of "$abs_active_home" "$abs_home"; then
+  if fm_path_is_same_or_descendant_by_identity "$abs_home" "$abs_active_home"; then
     echo "error: secondmate home cannot be inside the active firstmate home: $home" >&2
     return 1
   fi
-  if path_is_ancestor_of "$abs_root" "$abs_home"; then
+  if fm_path_is_same_or_descendant_by_identity "$abs_home" "$abs_root"; then
     echo "error: secondmate home cannot be inside the firstmate repo: $home" >&2
     return 1
   fi
-  if path_is_ancestor_of "$abs_home" "$abs_active_home"; then
+  if fm_path_is_same_or_descendant_by_identity "$abs_active_home" "$abs_home"; then
     echo "error: secondmate home cannot be an ancestor of the active firstmate home: $home" >&2
     return 1
   fi
-  if path_is_ancestor_of "$abs_home" "$abs_root"; then
+  if fm_path_is_same_or_descendant_by_identity "$abs_root" "$abs_home"; then
     echo "error: secondmate home cannot be an ancestor of the firstmate repo: $home" >&2
     return 1
   fi
@@ -897,17 +874,20 @@ validate_firstmate_operational_dirs() {
       echo "error: secondmate $name path is not a directory: $dir" >&2
       return 1
     else
-      abs_dir="$abs_home/$name"
+      # Not created yet, so it can only ever appear at "$abs_home/$name": there
+      # is no resolved directory to take an identity from, and none to escape.
+      continue
     fi
-    if ! path_is_ancestor_of "$abs_home" "$abs_dir"; then
+    if fm_path_is_same_dir "$abs_dir" "$abs_home" \
+       || ! fm_path_is_same_or_descendant_by_identity "$abs_dir" "$abs_home"; then
       echo "error: secondmate $name directory must resolve inside the secondmate home: $dir" >&2
       return 1
     fi
-    if [ "$abs_dir" = "$abs_active_home" ] || path_is_ancestor_of "$abs_active_home" "$abs_dir"; then
+    if fm_path_is_same_or_descendant_by_identity "$abs_dir" "$abs_active_home"; then
       echo "error: secondmate $name directory cannot be inside the active firstmate home: $dir" >&2
       return 1
     fi
-    if [ "$abs_dir" = "$abs_root" ] || path_is_ancestor_of "$abs_root" "$abs_dir"; then
+    if fm_path_is_same_or_descendant_by_identity "$abs_dir" "$abs_root"; then
       echo "error: secondmate $name directory cannot be inside the firstmate repo: $dir" >&2
       return 1
     fi
@@ -982,7 +962,7 @@ else
   # from it: the same repo reached by two spellings would otherwise lease
   # worktrees from two different pools. Canonical is also the only form that
   # can be compared against a backend's own current-path read as text, though
-  # nothing downstream relies on that - see same_dir.
+  # nothing downstream relies on that - see fm_path_is_same_dir.
   PROJ_ABS=$(physical_dir "$(resolve_project_dir_arg "$PROJ")") || {
     echo "error: project directory cannot be resolved: $PROJ" >&2
     exit 1
@@ -1085,7 +1065,7 @@ TASK_CWD=$PROJ_ABS
 #   - "the launch directory is genuinely outside the primary checkout" is the
 #     safety property, decided here. The primary checkout itself and everything
 #     underneath it are the hazard, however either path happens to be spelled.
-# Both use device+inode identity (same_dir,
+# Both use device+inode identity (fm_path_is_same_dir,
 # fm_path_is_same_or_descendant_by_identity), so a mis-cased or symlinked
 # spelling can neither manufacture a difference nor hide one, and an
 # unresolvable path fails closed rather than passing as plausible.
@@ -1095,18 +1075,38 @@ validate_spawn_worktree() {  # <source> <inspect-target>
     reason="it does not resolve to a directory"
   else
     wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null || true)
-    if [ -z "$wt_top" ] || ! same_dir "$WT" "$wt_top"; then
+    if [ -z "$wt_top" ] || ! fm_path_is_same_dir "$WT" "$wt_top"; then
       reason="it is not the top level of a git worktree"
     elif fm_path_is_same_or_descendant_by_identity "$WT" "$PROJ_ABS"; then
       reason="it is the primary checkout, or lives inside it"
     elif fm_path_is_same_or_descendant_by_identity "$WT" "$FM_ROOT"; then
       reason="it lives inside firstmate's own code root"
+    elif fm_path_is_same_or_descendant_by_identity "$WT" "$FM_HOME"; then
+      reason="it lives inside firstmate's operational home"
     fi
   fi
   [ -z "$reason" ] || {
-    echo "error: $source did not yield an isolated worktree - $reason (resolved '${WT:-none}'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
+    echo "error: $source did not yield an isolated worktree - $reason (resolved '${WT:-none}'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout.$(spawn_refusal_endpoint_hint "$inspect_target")" >&2
     exit 1
   }
+}
+
+# What an operator can still look at after a refusal, which depends on whether
+# the endpoint outlives it. Inside the isolation window the abort trap removes
+# the endpoint on the way out, so pointing at it would name a window that is
+# guaranteed to be gone and take the only record of how the wrong directory was
+# reached with it; fold that record into the message instead. Outside the window
+# (the orca call site) the endpoint survives, so the inspect hint is the useful
+# answer and stays.
+spawn_refusal_endpoint_hint() {  # <inspect-target>
+  local inspect_target=$1 pane
+  if [ "$SPAWN_ENDPOINT_ABORT_CLEANUP" != 1 ]; then
+    printf ' Inspect target %s' "$inspect_target"
+    return 0
+  fi
+  pane=$(fm_backend_capture "$BACKEND" "${T:-}" 120 "${W:-}" 2>/dev/null || true)
+  [ -n "$pane" ] || return 0
+  printf ' Last output from %s before it was removed:\n%s' "$inspect_target" "$pane"
 }
 
 herdr_projection_meta_field_exact() {  # <meta> <key>
@@ -1521,15 +1521,16 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$NEUTRAL_SET" -eq 0
   # worktree and tangle a hook into the primary checkout. The window id never lies.
   #
   # "Has the pane moved on from the project yet?" is decided by device+inode
-  # identity (same_dir), never by comparing path strings. A backend reports the
-  # pane's real cwd, so it names the directory in its true on-disk spelling; a
-  # project path typed in any other case, or reached through a symlink, can
-  # therefore never string-match that read. The loop then concluded on its FIRST
-  # poll that the pane had already left, and recorded the PRIMARY CHECKOUT as the
-  # worktree - which the old string-equality guard accepted, because a project
-  # clone is a genuine git top level distinct from the mis-spelled string it was
-  # compared against. The confirmation below could not catch it either: the wrong
-  # value was stable, so it agreed with itself immediately.
+  # identity (fm_path_is_same_dir), never by comparing path strings. A backend
+  # reports the pane's real cwd, so it names the directory in its true on-disk
+  # spelling; a project path typed in any other case, or reached through a
+  # symlink, can therefore never string-match that read. The loop then concluded
+  # on its FIRST poll that the pane had already left, and recorded the PRIMARY
+  # CHECKOUT as the worktree - which the old string-equality guard accepted,
+  # because a project clone is a genuine git top level distinct from the
+  # mis-spelled string it was compared against. The confirmation below could not
+  # catch it either: the wrong value was stable, so it agreed with itself
+  # immediately.
   #
   # A single read that already differs from the project is still not proof the
   # pane settled there: on some tmux/WSL setups a brand-new window's
@@ -1554,10 +1555,10 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$NEUTRAL_SET" -eq 0
     if [ -z "$p" ] || [ ! -d "$p" ]; then
       candidate=""
       settled_in_project=0
-    elif same_dir "$p" "$PROJ_ABS"; then
+    elif fm_path_is_same_dir "$p" "$PROJ_ABS"; then
       candidate=""
       settled_in_project=1
-    elif [ -n "$candidate" ] && same_dir "$p" "$candidate"; then
+    elif [ -n "$candidate" ] && fm_path_is_same_dir "$p" "$candidate"; then
       WT="$p"
       break
     else
@@ -1568,16 +1569,40 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$NEUTRAL_SET" -eq 0
   done
   if [ -z "$WT" ]; then
     if [ "$settled_in_project" -eq 1 ]; then
-      echo "error: the worker never left the primary checkout ($PROJ_ABS) within the ${wt_polls}-poll wait; refusing to launch to avoid tangling it. Check that treehouse get can lease a worktree for this project" >&2
+      # Confirmed unsafe: the pane is sitting in the primary checkout, so the
+      # endpoint goes with the refusal and its output comes along in the message.
+      echo "error: the worker never left the primary checkout ($PROJ_ABS) within the ${wt_polls}-poll wait; refusing to launch to avoid tangling it. Check that treehouse get can lease a worktree for this project.$(spawn_refusal_endpoint_hint "$T")" >&2
     else
-      echo "error: treehouse get did not settle in a worktree within the ${wt_polls}-poll wait; refusing to launch rather than accept an unresolved worktree" >&2
+      # Nothing unsafe has been established: the pane never resolved anywhere,
+      # so `treehouse get` may still be in flight. Killing the shell running it
+      # is what abandons a half-created pool slot or leaves an owner_pid naming
+      # a dead process, so the endpoint is left alone and stays inspectable.
+      SPAWN_ENDPOINT_ABORT_CLEANUP=0
+      echo "error: treehouse get did not settle in a worktree within the ${wt_polls}-poll wait; refusing to launch rather than accept an unresolved worktree. Inspect window $T" >&2
     fi
     exit 1
   fi
 
   validate_spawn_worktree "treehouse get" "$T"
-  SPAWN_ENDPOINT_ABORT_CLEANUP=0
 fi
+
+# Defence in depth, independent of the isolation assertion above, and like it
+# ahead of every side effect: a turn-end hook is a file written into the agent's
+# OWN directory, so writing one into firstmate's code root or operational home
+# arms it on firstmate's own session. Every firstmate turn then wakes the
+# watcher for a task that does not exist, which presents as unexplained wake
+# churn rather than as an error - the 2026-08-04 failure, which cost about forty
+# minutes of hunting a "phantom waker" firstmate was generating itself. Refuse
+# the write outright, so no future path can reintroduce it quietly.
+if [ "$KIND" != secondmate ]; then
+  if fm_path_is_same_dir "$WT" "$FM_ROOT" || fm_path_is_same_dir "$WT" "$FM_HOME"; then
+    echo "error: refusing to install a turn-end hook into firstmate's own tree ('$WT'); a worker must run in an isolated worktree.$(spawn_refusal_endpoint_hint "$T")" >&2
+    exit 1
+  fi
+fi
+# Every isolation refusal is behind us, so the endpoint is committed to and the
+# abort trap stops removing it.
+SPAWN_ENDPOINT_ABORT_CLEANUP=0
 
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
 # create GOTMPDIR, so mkdir before it is used; fm-teardown removes the whole root.
@@ -1591,21 +1616,6 @@ mkdir -p "$TASK_TMP/gotmp"
 # state/<id>.turn-ended when the agent finishes a turn. Worktree-resident hooks
 # and token pointers stay out of git's view so they never block teardown's dirty
 # check or leak into a commit.
-#
-# Defence in depth, independent of the isolation assertion above: a turn-end
-# hook is a file written into the agent's OWN directory, so writing one into
-# firstmate's code root or operational home arms it on firstmate's own session.
-# Every firstmate turn then wakes the watcher for a task that does not exist,
-# which presents as unexplained wake churn rather than as an error - the
-# 2026-08-04 failure, which cost about forty minutes of hunting a "phantom
-# waker" firstmate was generating itself. Refuse the write outright, so no
-# future path can reintroduce it quietly.
-if [ "$KIND" != secondmate ]; then
-  if same_dir "$WT" "$FM_ROOT" || same_dir "$WT" "$FM_HOME"; then
-    echo "error: refusing to install a turn-end hook into firstmate's own tree ('$WT'); a worker must run in an isolated worktree" >&2
-    exit 1
-  fi
-fi
 mkdir -p "$STATE"
 STATE_REAL=$(cd "$STATE" && pwd -P)
 TURNEND="$STATE_REAL/$ID.turn-ended"

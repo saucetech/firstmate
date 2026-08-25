@@ -3,6 +3,18 @@
 # filesystem identity while excluding repository, operational-home, and other
 # caller-supplied protected path trees in either ancestor direction.
 
+# Do two paths name the same directory? Decided by device+inode identity, never
+# by comparing strings: a case-insensitive volume, a symlink prefix, a hard link
+# and a bind mount each name one directory two ways, and lowercasing is not a
+# substitute because it would false-positive on genuinely distinct paths on a
+# case-sensitive volume. Fails closed - a missing or unreadable path is never
+# reported as the same directory.
+fm_path_is_same_dir() {  # <a> <b>
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  [ -d "$1" ] && [ -d "$2" ] || return 1
+  [ "$1" -ef "$2" ]
+}
+
 fm_path_is_same_or_descendant_by_identity() {
   local current=$1 ancestor=$2 parent
   [ -d "$current" ] && [ -d "$ancestor" ] || return 1
