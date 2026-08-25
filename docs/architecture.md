@@ -137,7 +137,13 @@ Codex App support is recorded in `docs/codex-app-backend.md`; it is not selectab
 ## Worktrees, not branches in your checkout
 
 Crewmates never intentionally touch your project clone; [treehouse](https://github.com/kunchenguid/treehouse) pools clean worktrees for tmux, herdr, zellij, and cmux tasks, while Orca creates its own worktrees for `backend=orca`.
-For ordinary ship and scout work, `fm-spawn.sh` refuses to launch unless the resolved task path is a real git worktree root that is distinct from the project primary checkout.
+For ordinary ship and scout work, `fm-spawn.sh` refuses to launch unless the resolved task path is a real git worktree root that lies outside the project primary checkout, firstmate's own code root, and its operational home.
+Outside is decided by device and inode identity, never by comparing path strings, so a mis-cased or symlinked spelling can neither hide a launch inside the primary checkout nor manufacture a false refusal, and a genuine worktree nested inside the primary checkout is refused however distinct it looks.
+Two relationships stay separate: whether the pane has moved on from the project at all is progress, decided by the bounded settle wait after `treehouse get`, while whether the launch directory is genuinely outside the primary checkout is the safety property, decided by the assertion.
+That assertion runs before any side effect - before the turn-end hook, the per-task temp root, and the task record - and fails closed: an unresolved worktree, or a pane still in the primary checkout when the wait expires, refuses the spawn rather than recording a plausible-looking path.
+A refusal that established an unsafe launch directory also removes the endpoint it created, so no live pane is left parked in the primary checkout; a spawn that merely never resolved anywhere leaves its endpoint alone and inspectable, because `treehouse get` may still be in flight and killing it would abandon a half-leased pool slot.
+Independently of it, a turn-end hook whose target directory is firstmate's own code root or operational home is refused outright, because such a hook would arm firstmate's own session for a task that is not there.
+The project path is canonicalized to its true on-disk spelling before the task pane is created, so one repository maps to one treehouse pool however its path was typed.
 A neutral verifier scout is the deliberate exception: it takes no treehouse lease and refuses unless its supplied directory is outside every repository (see "Two task shapes").
 
 The firstmate repo has one extra exposure because it can dispatch crewmates to work on itself.

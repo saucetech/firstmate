@@ -111,8 +111,11 @@
 #   be outside every project clone, the active firstmate home, and the firstmate repo.
 #   Before a secondmate launch, the home is locally fast-forwarded to the primary
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
-#   Ship/scout spawns refuse to launch unless the resolved task path is a real
-#   git worktree root distinct from the primary project checkout.
+#   Ship/scout spawns refuse to launch unless the resolved task path is a git
+#   worktree root lying outside the primary project checkout, the firstmate code
+#   root, and the operational home, decided by device+inode identity rather than
+#   by path text; an unresolved worktree refuses too. docs/architecture.md
+#   "Worktrees, not branches in your checkout" owns that contract.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Authorize verifier neutral-directory use and removal by durable path and
-# filesystem identity while excluding repository, operational-home, and other
-# caller-supplied protected path trees in either ancestor direction.
+# Own the shared device+inode path-identity predicates, and authorize verifier
+# neutral-directory use and removal by durable path and filesystem identity
+# while excluding repository, operational-home, and other caller-supplied
+# protected path trees in either ancestor direction.
 
 # Do two paths name the same directory? Decided by device+inode identity, never
 # by comparing strings: a case-insensitive volume, a symlink prefix, a hard link
