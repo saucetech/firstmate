@@ -364,14 +364,18 @@ crew_is_paused() {  # <id>
   [ "$(crew_absorb_class "$1")" = paused ]
 }
 
-# 0 (benign/absorb) if EVERY task referenced by a no-verb "signal:" wake is provably
-# working; 1 (actionable/surface) if any is not, or no task can be resolved. Pass the
-# same space-separated file list as signal_reason_is_actionable. Files are mapped to
-# task ids by stripping the .status / .turn-ended suffix; a no-verb wake with nothing
-# provably working must surface, so an empty/unresolvable list returns 1.
-signal_crew_provably_working() {  # <file> ...
-  local f base task seen=""
+# Single owner of the "signal:" wake file-list -> task vocabulary: maps each file
+# to a task id by stripping the .status / .turn-ended suffix, skips anything else,
+# and prints one "<dir>\t<task>" line per DISTINCT task in first-seen order.
+# <dir> is the file's directory, so a caller that must read that task's status file
+# does not have to re-derive it. Prints nothing for an empty or fully unresolvable
+# list; every caller decides on its own what an empty result means. Callers iterate
+# this output instead of repeating the parsing loop, so the suffix vocabulary and
+# the dedupe rule live in exactly one place.
+signal_tasks_of() {  # <file> ...
+  local f dir base task seen=""
   for f in "$@"; do
+    dir=${f%/*}
     base=${f##*/}
     case "$base" in
       *.status)     task=${base%.status} ;;
@@ -381,9 +385,50 @@ signal_crew_provably_working() {  # <file> ...
     [ -n "$task" ] || continue
     case " $seen " in *" $task "*) continue ;; esac
     seen="$seen $task"
-    crew_is_provably_working "$task" || return 1
+    printf '%s\t%s\n' "$dir" "$task"
   done
-  [ -n "$seen" ] || return 1
+}
+
+# 0 (benign/absorb) if EVERY task referenced by a no-verb "signal:" wake is provably
+# working; 1 (actionable/surface) if any is not, or no task can be resolved. Pass the
+# same space-separated file list as signal_reason_is_actionable. Files are mapped to
+# task ids by signal_tasks_of; a no-verb wake with nothing provably working must
+# surface, so an empty/unresolvable list returns 1.
+signal_crew_provably_working() {  # <file> ...
+  local dir task seen=0
+  while IFS=$(printf '\t') read -r dir task; do
+    [ -n "$task" ] || continue
+    seen=1
+    crew_is_provably_working "$task" < /dev/null || return 1
+  done <<EOF
+$(signal_tasks_of "$@")
+EOF
+  [ "$seen" -eq 1 ] || return 1
+  return 0
+}
+
+# 0 (all declared-paused) if EVERY task referenced by a no-verb "signal:" wake has
+# a declared-pause (paused:) last status line; 1 if any is not, or no task can be
+# resolved. Pass the same space-separated file list as signal_reason_is_actionable;
+# files resolve to tasks through signal_tasks_of.
+# Unlike signal_crew_provably_working, this is a pure status-line read - it never
+# calls fm-crew-state.sh - because the pause verb on the CURRENT last line is
+# definitive on its own: a crew that appended working: or a terminal verb after a
+# pause already fails this check, since last_status_line returns THAT line, not
+# the earlier paused: one, so classification reverts immediately. The watcher
+# treats an all-paused signal wake as an absorb class alongside provably-working,
+# subject to its own bounded re-surface cadence (signal_pause_resurface_due).
+signal_crew_declared_paused() {  # <file> ...
+  local dir task seen=0 last
+  while IFS=$(printf '\t') read -r dir task; do
+    [ -n "$task" ] || continue
+    seen=1
+    last=$(last_status_line "$dir/$task.status" < /dev/null)
+    status_is_paused "$last" || return 1
+  done <<EOF
+$(signal_tasks_of "$@")
+EOF
+  [ "$seen" -eq 1 ] || return 1
   return 0
 }
 
