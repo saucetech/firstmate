@@ -656,7 +656,17 @@ pause_state_class() {  # <window> <task>
     printf 'working'
     return
   fi
-  # A secondmate idles on its own watcher, so its endpoint liveness carries no
+  # An established episode has already spent its one look, so anything short of
+  # `working` settles back onto the bounded cadence. Returning here keeps the
+  # bounded re-read to a single crew_absorb_class call and no backend call: the
+  # liveness probe below only ever feeds a first look.
+  if [ "$established" -eq 0 ]; then
+    date +%s > "$recheck_file"
+    printf 'paused'
+    return
+  fi
+  # First look at this episode, and the only place endpoint liveness is read. A
+  # secondmate idles on its own watcher, so its endpoint liveness carries no
   # information about whether a decision gate is open; leave agent_alive empty
   # and let the authoritative class stand on its own.
   agent_alive=''
@@ -665,13 +675,6 @@ pause_state_class() {  # <window> <task>
     [ -n "$agent_alive" ] || agent_alive=unknown
   fi
   [ "$class" = none ] && [ "$agent_alive" = dead ] && class=paused
-  # An established episode has already spent its one look, so anything short of
-  # `working` settles back onto the bounded cadence.
-  if [ "$established" -eq 0 ]; then
-    date +%s > "$recheck_file"
-    printf 'paused'
-    return
-  fi
   if [ -n "$agent_alive" ] && [ "$agent_alive" != dead ]; then
     rm -f "$recheck_file"
     printf 'unconfirmed'
