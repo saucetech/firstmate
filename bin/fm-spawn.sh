@@ -1098,15 +1098,23 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 # reached with it; fold that record into the message instead. Outside the window
 # (the orca call site) the endpoint survives, so the inspect hint is the useful
 # answer and stays.
-spawn_refusal_endpoint_hint() {  # <inspect-target>
-  local inspect_target=$1 pane
+#
+# One target decides both what is read and what the message names, so the two can
+# never drift apart. Callers inside the isolation window pass the same
+# rename-safe handle the worktree-detection polls use ($WT_TARGET, tmux's stable
+# window id): a name-form tmux read whose window name was lost falls back to the
+# active client's window, which here would splice the captain's own pane into a
+# refusal on stderr. Every other backend addresses an explicit pane id, for which
+# $WT_TARGET is already $T.
+spawn_refusal_endpoint_hint() {  # <endpoint-target>
+  local target=$1 pane
   if [ "$SPAWN_ENDPOINT_ABORT_CLEANUP" != 1 ]; then
-    printf ' Inspect target %s' "$inspect_target"
+    printf ' Inspect target %s' "$target"
     return 0
   fi
-  pane=$(fm_backend_capture "$BACKEND" "${T:-}" 120 "${W:-}" 2>/dev/null || true)
+  pane=$(fm_backend_capture "$BACKEND" "$target" 120 "${W:-}" 2>/dev/null || true)
   [ -n "$pane" ] || return 0
-  printf ' Last output from %s before it was removed:\n%s' "$inspect_target" "$pane"
+  printf ' Last output from %s before it was removed:\n%s' "$target" "$pane"
 }
 
 herdr_projection_meta_field_exact() {  # <meta> <key>
@@ -1571,7 +1579,7 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$NEUTRAL_SET" -eq 0
     if [ "$settled_in_project" -eq 1 ]; then
       # Confirmed unsafe: the pane is sitting in the primary checkout, so the
       # endpoint goes with the refusal and its output comes along in the message.
-      echo "error: the worker never left the primary checkout ($PROJ_ABS) within the ${wt_polls}-poll wait; refusing to launch to avoid tangling it. Check that treehouse get can lease a worktree for this project.$(spawn_refusal_endpoint_hint "$T")" >&2
+      echo "error: the worker never left the primary checkout ($PROJ_ABS) within the ${wt_polls}-poll wait; refusing to launch to avoid tangling it. Check that treehouse get can lease a worktree for this project.$(spawn_refusal_endpoint_hint "${WT_TARGET:-$T}")" >&2
     else
       # Nothing unsafe has been established: the pane never resolved anywhere,
       # so `treehouse get` may still be in flight. Killing the shell running it
@@ -1583,7 +1591,7 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$NEUTRAL_SET" -eq 0
     exit 1
   fi
 
-  validate_spawn_worktree "treehouse get" "$T"
+  validate_spawn_worktree "treehouse get" "${WT_TARGET:-$T}"
 fi
 
 # Defence in depth, independent of the isolation assertion above, and like it
@@ -1596,7 +1604,7 @@ fi
 # the write outright, so no future path can reintroduce it quietly.
 if [ "$KIND" != secondmate ]; then
   if fm_path_is_same_dir "$WT" "$FM_ROOT" || fm_path_is_same_dir "$WT" "$FM_HOME"; then
-    echo "error: refusing to install a turn-end hook into firstmate's own tree ('$WT'); a worker must run in an isolated worktree.$(spawn_refusal_endpoint_hint "$T")" >&2
+    echo "error: refusing to install a turn-end hook into firstmate's own tree ('$WT'); a worker must run in an isolated worktree.$(spawn_refusal_endpoint_hint "${WT_TARGET:-$T}")" >&2
     exit 1
   fi
 fi
