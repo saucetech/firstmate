@@ -384,6 +384,12 @@ spawn_abort_cleanup() {
   fi
   if [ "$HERDR_PROJECTION_ABORT_CLEANUP" = 1 ]; then
     HERDR_PROJECTION_ABORT_CLEANUP=0
+    # A projected task pane IS this spawn's endpoint, and this exact-id cleanup
+    # owns removing it, under the presentation lock held right here. Leaving the
+    # endpoint kill below armed would close the same pane a second time after
+    # that lock is released, so a concurrent spawn's own create/close could
+    # interleave with this one's teardown.
+    SPAWN_ENDPOINT_ABORT_CLEANUP=0
     fm_backend_herdr_projection_cleanup_exact \
       "$HERDR_PROJECTION_ABORT_SESSION" \
       "$HERDR_PROJECTION_ABORT_TASK_PANE" \
