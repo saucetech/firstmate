@@ -302,8 +302,8 @@ window_to_task() {
 # captain-relevant last line; 1 otherwise. Pass the space-separated file list that
 # follows the "signal:" prefix. Non-.status arguments (e.g. .turn-ended markers,
 # which never carry a verb) are skipped. A 1 here is NOT "benign" on its own: a
-# no-verb signal (a bare turn-end, a working: note) is only benign when the crew is
-# also provably working (signal_crew_provably_working below); otherwise it surfaces.
+# no-verb signal (a bare turn-end, a working: note) is only benign when every task it
+# references is individually absorbable (signal_absorb_classes below); otherwise it surfaces.
 signal_reason_is_actionable() {  # <file> ...
   local f last
   for f in "$@"; do
@@ -389,46 +389,49 @@ signal_tasks_of() {  # <file> ...
   done
 }
 
-# 0 (benign/absorb) if EVERY task referenced by a no-verb "signal:" wake is provably
-# working; 1 (actionable/surface) if any is not, or no task can be resolved. Pass the
-# same space-separated file list as signal_reason_is_actionable. Files are mapped to
-# task ids by signal_tasks_of; a no-verb wake with nothing provably working must
-# surface, so an empty/unresolvable list returns 1.
-signal_crew_provably_working() {  # <file> ...
-  local dir task seen=0
+# Per-task absorb classification for a no-verb "signal:" wake. Prints one
+# "<task>\t<working|paused|none>" line per DISTINCT task referenced by the wake,
+# in signal_tasks_of order; prints nothing when no task resolves.
+#   working - crew_is_provably_working reports positive evidence of live work;
+#   paused  - the task's CURRENT last status line is a declared external wait;
+#   none    - neither, so this task alone forces the whole wake to surface.
+# PER TASK is the point: a coalesced wake batch is absorbed only when EVERY task
+# in it is individually absorbable, but the two absorb classes may now DIFFER
+# between tasks. The previous all-or-nothing pair of batch predicates surfaced a
+# batch mixing one working crew with one paused crew even though each task in it
+# was absorbable on its own, and with three or four crews live such mixed batches
+# are the common case, not the edge case.
+# The declared-pause test runs FIRST because it is a pure status-line read while
+# crew_is_provably_working may make a bounded fm-crew-state.sh call, so an
+# all-paused batch - the case this absorb exists for - now costs no crew-state
+# read at all. That ordering also means a task whose last line still declares a
+# pause is reported `paused` even if a run has since started under it: on this
+# path the pause verb on the CURRENT last line is definitive, exactly as it was
+# for the batch predicate it replaces, and the caller's bounded
+# PAUSE_RESURFACE_SECS recheck is what keeps a stale pause declaration from
+# rotting invisibly. The stale path keeps run-step precedence separately, through
+# fm-watch.sh's pause_state_class.
+# A crew that appended a terminal verb after a pause never reaches here: the
+# caller tests signal_reason_is_actionable over the whole batch first, so one
+# finished crew surfaces the entire batch regardless of how absorbable its
+# companions are.
+signal_absorb_classes() {  # <file> ...
+  local dir task last
   while IFS=$(printf '\t') read -r dir task; do
     [ -n "$task" ] || continue
-    seen=1
-    crew_is_provably_working "$task" < /dev/null || return 1
-  done <<EOF
-$(signal_tasks_of "$@")
-EOF
-  [ "$seen" -eq 1 ] || return 1
-  return 0
-}
-
-# 0 (all declared-paused) if EVERY task referenced by a no-verb "signal:" wake has
-# a declared-pause (paused:) last status line; 1 if any is not, or no task can be
-# resolved. Pass the same space-separated file list as signal_reason_is_actionable;
-# files resolve to tasks through signal_tasks_of.
-# Unlike signal_crew_provably_working, this is a pure status-line read - it never
-# calls fm-crew-state.sh - because the pause verb on the CURRENT last line is
-# definitive on its own: a crew that appended working: or a terminal verb after a
-# pause already fails this check, since last_status_line returns THAT line, not
-# the earlier paused: one, so classification reverts immediately. The watcher
-# treats an all-paused signal wake as an absorb class alongside provably-working,
-# subject to its own bounded re-surface cadence (signal_pause_resurface_due).
-signal_crew_declared_paused() {  # <file> ...
-  local dir task seen=0 last
-  while IFS=$(printf '\t') read -r dir task; do
-    [ -n "$task" ] || continue
-    seen=1
     last=$(last_status_line "$dir/$task.status" < /dev/null)
-    status_is_paused "$last" || return 1
+    if status_is_paused "$last"; then
+      printf '%s\tpaused\n' "$task"
+      continue
+    fi
+    if crew_is_provably_working "$task" < /dev/null; then
+      printf '%s\tworking\n' "$task"
+      continue
+    fi
+    printf '%s\tnone\n' "$task"
   done <<EOF
 $(signal_tasks_of "$@")
 EOF
-  [ "$seen" -eq 1 ] || return 1
   return 0
 }
 

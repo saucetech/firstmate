@@ -669,6 +669,61 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
   pass "fm-brief.sh: custom pause verb renders in every scaffold"
 }
 
+# The `resolved:`-un-declares-a-pause trap, hit live on 2026-08-24: a crew
+# declared a pause, later appended `resolved: <decision>` while STILL waiting on
+# the same external thing, and started escalating as a possible wedge. Both
+# supervisors classify a crew by its CURRENT LAST status line, and the natural
+# writing order - answer the decision, then go back to waiting - leaves exactly
+# the wrong final line.
+# The fix is deliberately here, in the crew-side status protocol, and NOT in the
+# classifier: teaching the classifier to look back past a `resolved:` line would
+# make it look back past the needs-decision that line just answered too, so an
+# already-answered decision would read as the current state forever - and
+# widening the last-line contract is the one thing the never-swallow-a-finish
+# guarantee rests on. A crew re-declaring its own wait costs nothing and risks
+# nothing.
+test_resolved_after_pause_must_redeclare_the_wait() {
+  local home kind id brief verb
+  home="$TMP_ROOT/resolved-pause-home"
+  mkdir -p "$home/data"
+
+  for kind in ship scout secondmate; do
+    id="brief-resolved-pause-$kind"
+    case "$kind" in
+      ship)
+        FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --mode no-mistakes >/dev/null 2>&1
+        ;;
+      scout)
+        FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --scout >/dev/null 2>&1
+        ;;
+      secondmate)
+        FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects >/dev/null 2>&1
+        ;;
+    esac
+    brief="$home/data/$id/brief.md"
+    assert_grep 'LAST status line must describe the state you are actually in when the turn ends' "$brief" \
+      "$kind brief did not state that the last status line must describe the current state"
+    # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+    assert_grep '`resolved:` closes a decision but is not a state' "$brief" \
+      "$kind brief did not distinguish the decision-closing verb from a state"
+    # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+    assert_grep 'append your `paused: {why}` line again after it' "$brief" \
+      "$kind brief did not require re-declaring a still-standing wait after a resolution"
+  done
+
+  # The rule follows the configured pause verb rather than hardcoding the
+  # literal, exactly as the rest of the status protocol does.
+  id="brief-resolved-pause-verb"
+  verb=awaiting
+  FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB="$verb" \
+    "$ROOT/bin/fm-brief.sh" "$id" firstmate --mode no-mistakes >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+  assert_grep 'append your `awaiting: {why}` line again after it' "$brief" \
+    "the re-declare rule did not follow the configured pause verb"
+  pass "fm-brief.sh: a resolution that leaves a crew still waiting must re-declare the wait"
+}
+
 test_scout_and_secondmate_load_decision_hold_policy() {
   local home scout charter
   home="$TMP_ROOT/decision-policy-home"
@@ -861,6 +916,7 @@ test_secondmate_no_projects_charter
 test_secondmate_marked_request_reporting_contract
 test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_pause_verb_override_renders_all_brief_scaffolds
+test_resolved_after_pause_must_redeclare_the_wait
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
 test_verify_brief_enforces_independence

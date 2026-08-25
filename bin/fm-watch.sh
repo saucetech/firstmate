@@ -7,31 +7,51 @@
 # actively-running no-mistakes step, or a backend busy signal), and surfaced
 # otherwise, so a crew that finishes (or stops and waits) without a current
 # working signal is never silently swallowed. A declared external-wait pause is
-# the separate idle absorb case, and it now applies to BOTH paths alike: a
-# no-verb wake whose referenced tasks ALL carry a declared pause (paused:) as
-# their CURRENT last status line is absorbed exactly like a provably-working
-# wake, and re-surfaces only on the long bounded PAUSE_RESURFACE_SECS cadence
-# (signal path: signal_crew_declared_paused + signal_pause_resurface_due; stale
-# path: handle_paused_stale). So a paused crew's status appends and turn-end
-# touches cost no firstmate turn, and no single append is guaranteed a look; the
-# bounded cadence, measured from when the pause episode was first OBSERVED
-# (signal_pause_track_episodes plants that anchor unconditionally, before the
-# branch dispatch) rather than from the last status write, is the guarantee that
-# a forgotten pause cannot rot invisibly, and its throttle is committed only
-# after the wake is durably appended so a failed append cannot consume a whole
-# window. A terminal verb appended after a pause still surfaces at once,
-# because classification reads only the current last line - as does a working:
-# note, which returns the task to ordinary provably-working classification.
+# the separate idle absorb case and applies to BOTH paths alike: a task carrying
+# a declared pause (paused:) as its CURRENT last status line is absorbed exactly
+# like a provably-working one, and re-surfaces only on the long bounded
+# PAUSE_RESURFACE_SECS cadence (signal path: signal_absorb_classes +
+# signal_pause_resurface_due; stale path: pause_state_class + handle_paused_stale).
+# On the signal path the absorb classes are decided PER TASK, so a coalesced wake
+# batch mixing a working crew with a paused crew - the common shape once three or
+# four crews are live - is absorbed whenever EVERY task in it found an absorb
+# class of its own, rather than being surfaced because no single class covered the
+# whole batch. On the stale path a declared pause the authoritative state does not
+# confirm (typically a still-live agent that may be parked at an interactive
+# decision gate) gets exactly ONE surfacing look per pause EPISODE, not one per
+# distinct pane hash, so ordinary pane churn - a spinner, an arriving steer, a log
+# line - can no longer re-open that look on every repaint.
+# So a paused crew's status appends and turn-end touches cost no firstmate turn,
+# and no single append is guaranteed a look; the bounded cadence, measured from
+# when the pause episode was first OBSERVED (signal_pause_track_episodes plants
+# that anchor unconditionally, before the branch dispatch) rather than from the
+# last status write, is the guarantee that a forgotten pause cannot rot invisibly,
+# and its throttle is committed only after the wake is durably appended so a
+# failed append cannot consume a whole window. A terminal verb appended after a
+# pause still surfaces at once - on the signal path it surfaces the WHOLE batch,
+# however absorbable its companions are - because classification reads only the
+# current last line; so does a working: note, which returns the task to ordinary
+# provably-working classification.
+# Because classification reads only the current LAST line, a crew that appends
+# `resolved:` after `paused:` while still waiting reads as neither paused nor
+# working and surfaces. The crew-side status protocol owns that ordering rule
+# (bin/fm-brief.sh's generated scaffolds): the last line must describe the state
+# the crew is actually in when its turn ends, so it re-appends its pause after a
+# resolution. Teaching the classifier to look back past a `resolved:` line was
+# rejected deliberately - the same look-back would resurrect an already-answered
+# needs-decision as the current state, and widening the last-line contract is the
+# one thing the never-swallow-a-finish guarantee rests on.
 # While state/.afk exists, the daemon owns triage and this watcher queues and exits
 # on every wake. Printed reason lines:
 #   signal: <file>...      status/turn-end signals, surfaced when a listed status
-#                          has a captain-relevant verb OR a no-verb signal's crew
-#                          is neither provably working nor declared paused,
-#                          unless afk is active. A no-verb signal whose tasks are
-#                          ALL declared paused is absorbed, and re-surfaces on the
-#                          PAUSE_RESURFACE_SECS cadence with a trailing
-#                          "(declared pause, rechecked on a long cadence not a
-#                          wedge; ...)" note - never as a wedge
+#                          has a captain-relevant verb OR any single task in the
+#                          batch is neither provably working nor declared paused,
+#                          unless afk is active. A no-verb signal every one of
+#                          whose tasks found an absorb class - working or paused,
+#                          and they need not agree - is absorbed; its paused tasks
+#                          re-surface on the PAUSE_RESURFACE_SECS cadence with a
+#                          trailing "(declared pause, rechecked on a long cadence
+#                          not a wedge; ...)" note - never as a wedge
 #   stale: <window>        a provably-working stale is ALWAYS absorbed (with a wedge
 #                          timer) regardless of what the status log says - an active
 #                          run-step or busy pane outranks even a captain-relevant log
@@ -41,7 +61,9 @@
 #                          re-surface cadence, never as a wedge. Only when neither
 #                          absorb class applies does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
-#                          both surfaced at once. A provably-working stale past the
+#                          both surfaced at once. A declared pause the authoritative
+#                          state does not confirm surfaces once per pause episode
+#                          and then joins the bounded cadence. A provably-working stale past the
 #                          wedge threshold also surfaces, with an "escalation N"
 #                          count in the reason, on the slow WORKING_STALE_ESCALATE_SECS
 #                          pace with per-repeat doubling bounded by BUSY_TURN_MAX_SECS
@@ -147,16 +169,17 @@ SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trai
 # and ABSORBS the benign majority - it advances the suppression marker, logs to a
 # debug log, and keeps blocking WITHOUT enqueuing or exiting. The no-verb signal
 # / stale path is absorb-only-when-provably-working: such a wake is absorbed ONLY
-# while the crew shows positive evidence it is still working (an actively-running
-# no-mistakes step, or a busy pane, via crew_is_provably_working over
-# fm-crew-state.sh), or while every referenced task declares an external-wait
-# pause on its current last status line (the separate idle absorb class described
-# in the file header, bounded on both paths by PAUSE_RESURFACE_SECS); a crew that
-# stopped its turn with no running pipeline, no busy pane and no declared pause is
-# SURFACED, so a finish reported only through interactive pane menus
-# (no done: status) is never swallowed. An ACTIONABLE wake (a captain-relevant
-# signal, a no-verb signal whose crew is neither provably working nor declared
-# paused, a declared pause due for its bounded recheck, any check, a stale
+# while each referenced crew shows positive evidence it is still working (an
+# actively-running no-mistakes step, or a busy pane, via crew_is_provably_working
+# over fm-crew-state.sh) or declares an external-wait pause on its current last
+# status line (the separate idle absorb class described in the file header,
+# bounded on both paths by PAUSE_RESURFACE_SECS); a crew that stopped its turn
+# with no running pipeline, no busy pane and no declared pause is SURFACED - and
+# on the signal path it surfaces the whole batch it arrived in - so a finish
+# reported only through interactive pane menus (no done: status) is never
+# swallowed. An ACTIONABLE wake (a captain-relevant signal, a no-verb signal with
+# any task that is neither provably working nor declared paused, a declared pause
+# due for its bounded recheck, any check, a stale
 # pane whose crew is not provably working, a provably-working stale past the
 # threshold, or anything unknown) is written to the durable queue and exits, which
 # is what wakes the LLM through the background-task completion. The same classifier
@@ -425,7 +448,7 @@ handle_paused_stale() {  # <window> <task> <hash>
 # Planting here rather than inside signal_pause_resurface_due is what makes the
 # episode clock run from when the pause was first OBSERVED: the branch dispatch
 # below evaluates afk_present, signal_reason_is_actionable and
-# signal_crew_provably_working first, so a pause first seen during an away-mode
+# signal_batch_absorbable first, so a pause first seen during an away-mode
 # stretch (or while the crew was still provably working) would otherwise plant
 # its anchor only on the first wake that reached the paused branch, and a pause
 # already days old would not come due for another full window. Away mode still
@@ -460,13 +483,56 @@ EOF
 # so it never carries a stale task across watcher poll cycles.
 SIGNAL_PAUSE_DUE_TASKS=""
 
-# Bounded recheck for a no-verb signal wake absorbed only because
-# signal_crew_declared_paused reports every referenced task paused: fires once
-# per PAUSE_RESURFACE_SECS per task so a forgotten pause on the signal path
-# cannot rot invisibly. Keyed by task id rather than a window key, since the
+# Tasks the current no-verb signal wake absorbed as a DECLARED PAUSE, as
+# reported per task by signal_absorb_classes. Only these carry the bounded
+# pause recheck; a task absorbed as provably-working is covered by the stale
+# path's wedge timer instead and must not be handed to
+# signal_pause_resurface_due.
+SIGNAL_ABSORB_PAUSED_TASKS=""
+
+# 0 (absorb) if EVERY task referenced by a no-verb "signal:" wake is
+# individually absorbable - provably working OR carrying a declared pause as its
+# current last status line - and 1 (surface) if any is neither, or no task
+# resolves. Classifies PER TASK through signal_absorb_classes, so a coalesced
+# batch mixing one working crew with one paused crew is now absorbed; the
+# all-or-nothing batch predicates it replaces matched neither class and cost a
+# full firstmate turn even though every task in the batch was absorbable on its
+# own. With three or four crews live, most wake batches carry more than one task,
+# so that mixed case is the common one.
+# Records the paused subset in SIGNAL_ABSORB_PAUSED_TASKS for the caller's
+# bounded recheck. Deliberately does NOT short-circuit on the first
+# non-absorbable task: a wake that is about to cost a full supervision turn can
+# afford the remaining bounded state reads, and classifying the whole batch keeps
+# this a plain report rather than an order-dependent one.
+signal_batch_absorbable() {  # <file> ...
+  local task class seen=0 blocked=1
+  SIGNAL_ABSORB_PAUSED_TASKS=""
+  while IFS=$(printf '\t') read -r task class; do
+    [ -n "$task" ] || continue
+    seen=1
+    case "$class" in
+      paused)  SIGNAL_ABSORB_PAUSED_TASKS="$SIGNAL_ABSORB_PAUSED_TASKS $task" ;;
+      working) ;;
+      *)       blocked=0 ;;
+    esac
+  done <<EOF
+$(signal_absorb_classes "$@")
+EOF
+  [ "$seen" -eq 1 ] || return 1
+  [ "$blocked" -eq 1 ] || return 1
+  return 0
+}
+
+# Bounded recheck for the tasks a no-verb signal wake absorbed as a declared
+# pause: fires once per PAUSE_RESURFACE_SECS per task so a forgotten pause on the
+# signal path cannot rot invisibly. Takes TASK IDS (the SIGNAL_ABSORB_PAUSED_TASKS
+# subset), not the wake's file list, since after per-task classification only some
+# of a batch may be paused. Keyed by task id rather than a window key, since the
 # signal path classifies before the stale loop below resolves any window, and
 # measured from the per-task episode-start anchor that
 # signal_pause_track_episodes plants unconditionally above.
+# With no paused task in the batch there is nothing on this cadence, so an empty
+# argument list reports nothing due.
 # This is a PURE REPORT: it writes nothing. It records the due tasks in
 # SIGNAL_PAUSE_DUE_TASKS, and signal_pause_commit_resurface stamps their
 # .paused-signal-resurfaced-<task> throttles only AFTER the caller has durably
@@ -474,22 +540,18 @@ SIGNAL_PAUSE_DUE_TASKS=""
 # fm_wake_append that fails (full disk, queue write error) cannot silently
 # consume a whole PAUSE_RESURFACE_SECS of the bounded recheck: the re-armed
 # watcher finds no throttle, reports due again, and re-surfaces the pause.
-signal_pause_resurface_due() {  # <file> ...
-  local dir task seen=0 since_age rf_age result=1
+signal_pause_resurface_due() {  # <task> ...
+  local task since_age rf_age result=1
   SIGNAL_PAUSE_DUE_TASKS=""
-  while IFS=$(printf '\t') read -r dir task; do
+  for task in "$@"; do
     [ -n "$task" ] || continue
-    seen=1
     since_age=$(age_of "$STATE/.paused-signal-since-$task")
     rf_age=$(age_of "$STATE/.paused-signal-resurfaced-$task")   # 999999 when no prior re-surface
     if [ "$since_age" -ge "$PAUSE_RESURFACE_SECS" ] && [ "$rf_age" -ge "$PAUSE_RESURFACE_SECS" ]; then
       SIGNAL_PAUSE_DUE_TASKS="$SIGNAL_PAUSE_DUE_TASKS $task"
       result=0
     fi
-  done <<EOF
-$(signal_tasks_of "$@")
-EOF
-  [ "$seen" -eq 1 ] || return 1
+  done
   return "$result"
 }
 
@@ -523,11 +585,45 @@ clear_pause_tracking() {  # <window>
   rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
 }
 
-# Reconcile a declared pause or captain-held status with authoritative crew state.
-# Only a confidently dead ordinary crew may recover paused classification after
-# fm-crew-state has fallen back to stopped or unknown.
+# Reconcile a declared pause or captain-held status with authoritative crew state
+# and print exactly ONE class. The four classes are distinct on purpose - the two
+# stale branches below both dispatch on them and must agree on what each means:
+#   working     - an actively-running pipeline or busy pane outranks the log line,
+#                 so absorb and run the wedge timer;
+#   paused      - the declared wait is confirmed as a safe absorb, so use the
+#                 bounded PAUSE_RESURFACE_SECS cadence, never the wedge timer;
+#   unconfirmed - a declared pause or captain hold that authoritative state does
+#                 NOT confirm as a safe absorb: the crew's agent is still live
+#                 (it may be sitting at an interactive decision gate the pause
+#                 line does not describe), or fm-crew-state read something other
+#                 than the declared wait. That disconfirming case gets exactly
+#                 ONE look per pause EPISODE and then falls onto the bounded
+#                 cadence - see below for why the episode, not the pane hash, is
+#                 the unit;
+#   none        - no declared pause or hold at all and no absorb class, so the
+#                 caller applies its ordinary non-terminal stale handling.
+# `unconfirmed` exists because `none` previously carried both of the last two
+# meanings at once, and the two stale branches read it oppositely: one surfaced
+# it and the other absorbed it. That is what made a correctly-declared pause on a
+# LIVE ordinary crew surface over and over instead of once. Absorb was reached
+# only through the tracked-episode fast path below, whose own liveness test then
+# dropped the episode markers again, so every pane-content change - a spinner, an
+# arriving steer, a log line - re-ran the first-sight classification and produced
+# another wake. Four crews parked on one quota reset therefore cost a full
+# firstmate turn per pane repaint for a whole day, each carrying a correct
+# `paused:` last line.
+# The episode is the unit of the one look. $STATE/.paused-<key> means "this key's
+# stale is already on the bounded pause cadence": handle_paused_stale plants it on
+# an absorb and surface_nonterminal_stale plants it on a surface, so whichever way
+# the first look goes, every later poll of the same episode re-affirms `paused`
+# through the fast path regardless of how much the pane has churned. The episode
+# ends when the last status line stops declaring a wait (the stale loop clears the
+# tracking) or when the periodic authoritative re-read reports `working`.
+# A confidently dead ordinary crew is the opposite case and still recovers
+# `paused` even when fm-crew-state has fallen back to stopped or unknown: its
+# endpoint is expected to sit idle, so there is no live gate to expose.
 pause_state_class() {  # <window> <task>
-  local win=$1 task=$2 key last recheck_file class agent_alive
+  local win=$1 task=$2 key last recheck_file class agent_alive established
   key=${win//:/_}
   key=${key//\//_}
   key=${key//./_}
@@ -538,15 +634,12 @@ pause_state_class() {  # <window> <task>
     crew_absorb_class "$task"
     return
   fi
-  if [ -e "$STATE/.paused-$key" ] && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ]; then
-    if [ "$(window_kind "$win")" != secondmate ]; then
-      agent_alive=$(fm_backend_agent_alive "$(window_backend "$win")" "$win" 2>/dev/null) || agent_alive=unknown
-      if [ "$agent_alive" != dead ]; then
-        rm -f "$recheck_file"
-        printf 'none'
-        return
-      fi
-    fi
+  established=1
+  [ -e "$STATE/.paused-$key" ] && established=0
+  # Cheap re-affirmation of an established episode: no crew-state read and no
+  # backend call at all. Bounded by STALE_ESCALATE_SECS so a pause that has
+  # quietly become real work is still re-read authoritatively once per window.
+  if [ "$established" -eq 0 ] && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ]; then
     printf 'paused'
     return
   fi
@@ -556,15 +649,25 @@ pause_state_class() {  # <window> <task>
     printf 'working'
     return
   fi
+  # A secondmate idles on its own watcher, so its endpoint liveness carries no
+  # information about whether a decision gate is open; leave agent_alive empty
+  # and let the authoritative class stand on its own.
+  agent_alive=''
   if [ "$(window_kind "$win")" != secondmate ]; then
     agent_alive=$(fm_backend_agent_alive "$(window_backend "$win")" "$win" 2>/dev/null) || agent_alive=unknown
-    if [ "$agent_alive" != dead ]; then
-      rm -f "$recheck_file"
-      printf 'none'
-      return
-    fi
+    [ -n "$agent_alive" ] || agent_alive=unknown
   fi
-  [ "$class" = none ] && [ "${agent_alive:-unknown}" = dead ] && class=paused
+  [ "$class" = none ] && [ "$agent_alive" = dead ] && class=paused
+  if [ "$class" = paused ] && [ "$established" -eq 0 ]; then
+    date +%s > "$recheck_file"
+    printf 'paused'
+    return
+  fi
+  if [ -n "$agent_alive" ] && [ "$agent_alive" != dead ]; then
+    rm -f "$recheck_file"
+    printf 'unconfirmed'
+    return
+  fi
   case "$class" in
     paused) date +%s > "$recheck_file" ;;
     *) rm -f "$recheck_file" ;;
@@ -1043,23 +1146,34 @@ EOF
     # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
     #   - the away-mode daemon owns triage (afk) and wants every wake;
     #   - any status file carries a captain-relevant verb;
-    #   - or it is a no-verb wake (a bare turn-end, a working: note) whose crew is
-    #     NOT provably working - the crew stopped its turn with no actively-running
-    #     pipeline and no busy pane, so it may be done (even via an interactive menu
-    #     that wrote no done: status), waiting on a decision, or wedged. Absorbing
-    #     such a turn-end is exactly the swallowed-finish this change guards against.
-    # Actionable -> enqueue, advance .seen-* markers, exit. Benign (a no-verb wake
-    # whose crew IS provably working) in always-on mode -> advance the markers so it
-    # will not re-fire, log, and keep blocking without enqueuing. A no-verb wake
-    # whose crew is instead declared paused (signal_crew_declared_paused) is the
-    # same absorb class, subject to its own bounded PAUSE_RESURFACE_SECS recheck
-    # (signal_pause_resurface_due) so a forgotten pause cannot rot invisibly; a
-    # terminal verb already took the actionable branch above regardless of any
-    # earlier pause, and a crew that appends working: after a pause reads as
-    # neither actionable nor paused here, so it falls through to the ordinary
-    # provably-working test. The provably-working check is the only costly one
-    # (it may run a bounded no-mistakes call), so the branch ordering evaluates
-    # it ONLY for a non-afk, no-captain-verb signal.
+    #   - or it is a no-verb wake (a bare turn-end, a working: note) referencing
+    #     ANY task that is neither provably working nor carrying a declared pause -
+    #     that crew stopped its turn with no actively-running pipeline, no busy
+    #     pane and no declared wait, so it may be done (even via an interactive
+    #     menu that wrote no done: status), waiting on a decision, or wedged.
+    #     Absorbing such a turn-end is exactly the swallowed-finish this guards
+    #     against.
+    # Actionable -> enqueue, advance .seen-* markers, exit. Benign in always-on
+    # mode -> advance the markers so it will not re-fire, log, and keep blocking
+    # without enqueuing.
+    # The absorb test is PER TASK (signal_batch_absorbable over
+    # signal_absorb_classes), not per batch: each task in a coalesced wake picks
+    # its own absorb class, and the whole wake is absorbed when every task found
+    # one. A batch mixing a working crew with a paused crew previously matched
+    # neither all-or-nothing class and surfaced, which with three or four crews
+    # live was the common shape rather than the exception.
+    # The tasks absorbed as a declared pause carry their own bounded
+    # PAUSE_RESURFACE_SECS recheck (signal_pause_resurface_due over
+    # SIGNAL_ABSORB_PAUSED_TASKS) so a forgotten pause cannot rot invisibly, while
+    # a task absorbed as provably working stays covered by the stale path's wedge
+    # timer instead. A terminal verb already took the actionable branch above
+    # regardless of any earlier pause or of how absorbable the rest of its batch
+    # is, and a crew that appends working: after a pause reads as neither
+    # actionable nor paused, so it falls through to the ordinary provably-working
+    # test. The provably-working check is the only costly one (it may run a
+    # bounded no-mistakes call), so it is evaluated ONLY for a non-afk,
+    # no-captain-verb signal, and only for tasks that are not already declared
+    # paused.
     # signal_pause_track_episodes runs first and unconditionally: it is a cheap
     # status-line read that plants the pause-episode anchor of any referenced
     # task that IS paused and retires the markers of any that has left its pause,
@@ -1068,13 +1182,13 @@ EOF
     # a pause first seen during an away-mode stretch.
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
     signal_pause_track_episodes $files
-    # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
+    # The directive covers this whole compound command: both $files and the task-id
+    # list are space-separated and neither ids nor state paths carry spaces.
+    # shellcheck disable=SC2086
     if afk_present || signal_reason_is_actionable $files; then
       surface_signal=1
-    elif signal_crew_provably_working $files; then
-      surface_signal=0
-    elif signal_crew_declared_paused $files; then
-      if signal_pause_resurface_due $files; then
+    elif signal_batch_absorbable $files; then
+      if signal_pause_resurface_due $SIGNAL_ABSORB_PAUSED_TASKS; then
         surface_signal=1
         reason="$reason (declared pause, rechecked on a long cadence not a wedge; confirm the wait still holds)"
       else
@@ -1203,13 +1317,24 @@ EOF
         else
           # Non-terminal stale: a crew gone quiet without a captain-relevant status.
           # Decided once per distinct stale hash (the costly state reads run only
-          # on first sight, never every poll) via pause_state_class, which returns:
+          # on first sight, never every poll) via pause_state_class, whose four
+          # classes are documented at that function. The two arms below - first
+          # sighting of a hash, and a repeat poll of one already classified -
+          # dispatch on the SAME class vocabulary and must not disagree about what
+          # a class means:
           #   - working: an actively-running pipeline legitimately sits on a static
           #     pane (e.g. waiting on CI), so absorb and start the wedge timer so a
           #     genuinely frozen run still escalates past WORKING_STALE_ESCALATE_SECS;
-          #   - paused: the crew declared an external wait, or a declared pause or
-          #     captain hold is paired with a confidently dead agent, so absorb on
-          #     the long PAUSE_RESURFACE_SECS cadence instead of wedge-escalating;
+          #   - paused: the declared wait is confirmed as a safe absorb (including a
+          #     declared pause or captain hold paired with a confidently dead
+          #     agent), so absorb on the long PAUSE_RESURFACE_SECS cadence instead
+          #     of wedge-escalating;
+          #   - unconfirmed: a declared wait authoritative state does not confirm -
+          #     typically a still-live agent that may be parked at an interactive
+          #     decision gate the pause line does not describe. Surface it ONCE, in
+          #     either arm; the surface plants the episode markers, so every later
+          #     poll of that episode re-affirms `paused` however much the pane
+          #     churns.
           #   - none: no running pipeline, no exact busy verdict, no declared pause.
           #     Surface immediately so firstmate inspects the inconclusive state
           #     (it may be done via an interactive menu that wrote no done: status,
@@ -1227,6 +1352,10 @@ EOF
               paused)
                 handle_paused_stale "$w" "$task" "$h"
                 ;;
+              # unconfirmed and none alike: neither is an absorb class, and on a
+              # hash's first sighting both mean "look at this now". For
+              # `unconfirmed` the surface is also what plants the episode markers,
+              # so this look is not repeated for the rest of that pause episode.
               *)
                 surface_nonterminal_stale "$w" "$h"
                 ;;
@@ -1240,7 +1369,19 @@ EOF
                          printf '%s' "$h" > "$sf"
                          wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
-                *)       handle_paused_stale "$w" "$task" "$h" ;;
+                # The disconfirming look, taken at most once per episode: reached
+                # here only when this key has no established episode yet, or when
+                # the bounded STALE_ESCALATE_SECS re-read of an established one
+                # reported the wait no longer confirmed. Surfacing re-plants the
+                # episode markers, so the next poll re-affirms `paused` rather
+                # than re-appending this wake.
+                unconfirmed) surface_nonterminal_stale "$w" "$h" ;;
+                # `none` needs a declared wait to have gone away entirely, which
+                # the stale loop's own clear_pause_tracking already handles above;
+                # fall back to the ordinary non-terminal treatment rather than
+                # absorbing an undeclared quiet pane onto the pause cadence.
+                *)       clear_pause_state "$w"
+                         wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf" ;;
               esac
             else
               wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf"
@@ -1270,6 +1411,12 @@ EOF
       fi
       task=$(window_to_task "$w" "$STATE")
       if ! afk_present && status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" && [ "$busy_now" -ne 0 ]; then
+        # The pane just CHANGED, so it is not stale yet and nothing is surfaced
+        # here. An established pause episode re-affirms `paused` cheaply and stays
+        # absorbed however often the pane repaints - that is what keeps a parked
+        # crew from re-opening its one look on every spinner frame. Any other class
+        # drops the tracking, so the look this key may still be owed is taken when
+        # the pane actually goes stale again.
         case "$(pause_state_class "$w" "$task")" in
           paused) handle_paused_stale "$w" "$task" "$h" ;;
           *)      clear_pause_tracking "$w" ;;

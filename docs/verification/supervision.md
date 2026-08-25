@@ -241,6 +241,29 @@ tests/fm-claude-stop-autoarm.test.sh
 tests/fm-turnend-guard.test.sh
 ```
 
+## Absorb coverage for a working-and-paused fleet
+
+Measured 2026-08-24 against the tracked watcher on macOS 26.5.2, with a hermetic `fm-crew-state.sh` fake and no real backend, comparing the tracked triage with the previous revision.
+Both numbers come from driving a real `bin/fm-watch.sh` and counting what it actually queued, not from reading the classifier.
+
+Fleet: four crews, none finished - two mid-validation (provably working, no-verb last line) and two parked on a declared `paused:` external wait.
+
+| Path | Exercise | Previous | Tracked |
+| --- | --- | --- | --- |
+| Signal | all 15 non-empty coalesced wake batches that fleet can produce | 9 surfaced, 6 absorbed | 0 surfaced, 15 absorbed |
+| Stale | one parked live crew whose pane repaints between 10 consecutive polls | 10 stale wakes | 1 stale wake |
+
+Every one of the 9 previously-surfacing batches was a mixed batch - at least one working and one paused task - which is why the all-or-nothing batch classes matched neither.
+On the stale path the parked crew's repaints each re-opened the fail-open look at a live agent under a declared pause; that look is now taken once per pause episode, and the wake counted above is that single look.
+Both absorbs remain bounded by `FM_PAUSE_RESURFACE_SECS`, so a forgotten pause still comes due for its recheck; `tests/fm-watch-triage.test.sh` pins that alongside the never-swallow-a-finish, away-mode, and post-pause-`working:` guarantees.
+
+Deterministic entry points:
+
+```sh
+tests/fm-watch-triage.test.sh
+tests/fm-brief.test.sh
+```
+
 ## Wedge-alarm channels
 
 The two real notification channels were bounded manually on 2026-07-10 on macOS 26.5.2 with Herdr 0.7.3.

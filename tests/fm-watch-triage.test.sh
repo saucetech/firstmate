@@ -343,55 +343,51 @@ test_crew_absorb_class_classifier() {
   pass "crew_absorb_class: working/paused/none from one read; crew_is_paused and crew_is_provably_working agree"
 }
 
-# signal_crew_provably_working: a no-verb "signal:" wake is benign ONLY when EVERY
-# task it references is provably working; if any crew has stopped, or no task can be
-# resolved, it surfaces. Files map to ids by stripping .status / .turn-ended.
-test_signal_crew_provably_working_classifier() {
-  local dir fakebin state
-  dir=$(make_case signal-provably-working); fakebin="$dir/fakebin"; state="$dir/state"
+# signal_absorb_classes: the per-task absorb classifier the signal path now uses
+# in place of the two all-or-nothing batch predicates. It prints one
+# "<task>\t<class>" line per DISTINCT referenced task, so a coalesced batch may
+# carry a different absorb class per task. The declared-pause test runs first and
+# is a PURE status-line read (no fm-crew-state.sh call) - the pause verb on the
+# CURRENT last line is definitive on its own, so a task whose last line has since
+# moved past paused: (a terminal verb, or a working: note) is classified from its
+# authoritative crew state instead.
+classes_of() {  # <file> ... ; prints "task=class task=class ..." on one line
+  signal_absorb_classes "$@" | awk -F '\t' '{ printf "%s=%s ", $1, $2 }'
+}
+
+test_signal_absorb_classes_classifier() {
+  local dir fakebin state out
+  dir=$(make_case signal-absorb-classes); fakebin="$dir/fakebin"; state="$dir/state"
   export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
   export FM_FAKE_CREW_STATE_a='state: working · source: run-step · running'
   export FM_FAKE_CREW_STATE_b='state: done · source: run-step · run passed'
-  signal_crew_provably_working "$state/a.status" "$state/a.turn-ended" \
-    || fail "a single provably-working crew (status+turn-end) was not benign"
-  ! signal_crew_provably_working "$state/a.status" "$state/b.turn-ended" \
-    || fail "a coalesced batch including a stopped crew was treated as benign"
-  ! signal_crew_provably_working "$state/b.turn-ended" \
-    || fail "a stopped crew's bare turn-end was treated as benign"
-  ! signal_crew_provably_working "$state/a.meta" \
-    || fail "a non-signal file resolved to a benign verdict"
-  ! signal_crew_provably_working \
-    || fail "an empty signal file list was treated as benign"
-  unset FM_FAKE_CREW_STATE_a FM_FAKE_CREW_STATE_b
-  pass "signal_crew_provably_working: benign only when every referenced crew is provably working"
-}
-
-# signal_crew_declared_paused: the signal-path counterpart of
-# signal_crew_provably_working. Unlike that predicate it is a PURE status-line
-# read (no fm-crew-state.sh call) - the pause verb on the CURRENT last line is
-# definitive on its own, so a task whose last line has since moved past paused:
-# (a terminal verb, or a working: note) already fails this check because
-# last_status_line returns that newer line.
-test_signal_crew_declared_paused_classifier() {
-  local dir state
-  dir=$(make_case signal-declared-paused); state="$dir/state"
-  printf 'paused: holding for the upstream release\n' > "$state/a.status"
-  printf 'paused: waiting on a rate-limit reset\n' > "$state/b.status"
-  signal_crew_declared_paused "$state/a.status" "$state/a.turn-ended" \
-    || fail "a single declared-paused task (status+turn-end) was not classed all-paused"
-  signal_crew_declared_paused "$state/a.status" "$state/b.status" \
-    || fail "two declared-paused tasks were not classed all-paused"
-  printf 'done: shipped\n' > "$state/c.status"
-  ! signal_crew_declared_paused "$state/a.status" "$state/c.turn-ended" \
-    || fail "a coalesced batch including a finished (done:) task was treated as all-paused"
+  printf 'paused: holding for the upstream release\n' > "$state/c.status"
   printf 'working: compiling\n' > "$state/d.status"
-  ! signal_crew_declared_paused "$state/d.turn-ended" \
-    || fail "a working: task's bare turn-end was treated as all-paused"
-  ! signal_crew_declared_paused "$state/a.meta" \
-    || fail "a non-signal file resolved to an all-paused verdict"
-  ! signal_crew_declared_paused \
-    || fail "an empty signal file list was treated as all-paused"
-  pass "signal_crew_declared_paused: all-paused only when every referenced task's CURRENT last line is paused:"
+  export FM_FAKE_CREW_STATE_d='state: unknown · source: none · no current-state source available'
+
+  out=$(classes_of "$state/a.status" "$state/a.turn-ended")
+  [ "$out" = "a=working " ] || fail "a provably-working crew's status+turn-end did not dedupe to one working task, got [$out]"
+  out=$(classes_of "$state/b.turn-ended")
+  [ "$out" = "b=none " ] || fail "a stopped crew's bare turn-end was not classed none, got [$out]"
+  out=$(classes_of "$state/c.status")
+  [ "$out" = "c=paused " ] || fail "a declared pause was not classed paused, got [$out]"
+  out=$(classes_of "$state/d.turn-ended")
+  [ "$out" = "d=none " ] || fail "a working: note with no authoritative work was not classed none, got [$out]"
+
+  # The mixed batch defect 2 is about: one working crew, one paused crew. Each
+  # task keeps its own class rather than the batch collapsing to no class at all.
+  out=$(classes_of "$state/a.status" "$state/c.status")
+  [ "$out" = "a=working c=paused " ] || fail "a mixed working+paused batch lost its per-task classes, got [$out]"
+  # One stopped crew still shows up as `none` beside absorbable companions.
+  out=$(classes_of "$state/a.status" "$state/c.status" "$state/b.turn-ended")
+  [ "$out" = "a=working c=paused b=none " ] || fail "a stopped crew was hidden inside a mixed batch, got [$out]"
+
+  out=$(classes_of "$state/a.meta")
+  [ -z "$out" ] || fail "a non-signal file produced an absorb class, got [$out]"
+  out=$(classes_of)
+  [ -z "$out" ] || fail "an empty signal file list produced an absorb class, got [$out]"
+  unset FM_FAKE_CREW_STATE_a FM_FAKE_CREW_STATE_b FM_FAKE_CREW_STATE_d
+  pass "signal_absorb_classes: one absorb class per task, working and paused may differ inside one batch"
 }
 
 # --- benign wakes are absorbed ONLY when the crew is provably working ---------
@@ -625,6 +621,187 @@ test_signal_working_after_pause_returns_to_normal() {
   grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "post-pause working: signal was not queued"
   unset FM_PAUSE_RESURFACE_SECS
   pass "a working: note appended after a pause returns to normal (provably-working) classification immediately"
+}
+
+# --- coalesced batches: the absorb classes are decided PER TASK ---------------
+#     Defect 2 of fm-watch-absorb-followups. The signal path previously asked two
+#     all-or-nothing questions of a whole wake batch - "is EVERY task provably
+#     working?" then "is EVERY task declared paused?" - so a batch mixing one
+#     working crew with one paused crew matched NEITHER and surfaced, costing a
+#     full firstmate turn even though every task in it was individually
+#     absorbable. Firstmate measured its own wakes on 2026-08-24: with three or
+#     four crews live most batches carry two or three tasks, so the mixed batch is
+#     the common shape, not the edge case, and the uniform-batch absorb that
+#     shipped before this captured only a minority of the waste.
+#     Every guarantee is re-pinned here in its BATCH form, because per-task
+#     classification is exactly where a batch-level guarantee could be lost.
+
+# Fixture for the mixed-batch cases: task `alpha` is provably working, task
+# `bravo` carries a declared pause. Both status files are written before the
+# watcher starts, so the per-poll scan coalesces them into ONE signal wake.
+# Runs in the CALLER's shell (no command substitution) because the per-id
+# crew-state fakes must be exported into the environment the watcher inherits;
+# the case directory comes back in MIXED_BATCH_DIR rather than on stdout.
+MIXED_BATCH_DIR=""
+make_mixed_batch() {  # <case-name>; sets MIXED_BATCH_DIR
+  local state
+  MIXED_BATCH_DIR=$(make_case "$1"); state="$MIXED_BATCH_DIR/state"
+  printf 'working: compiling step 2\n' > "$state/alpha.status"
+  printf 'paused: holding for the upstream release\n' > "$state/bravo.status"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake default'
+  export FM_FAKE_CREW_STATE_alpha='state: working · source: run-step · validating (running)'
+}
+
+unset_mixed_batch() {
+  unset FM_FAKE_CREW_STATE_alpha FM_FAKE_CREW_STATE_bravo FM_FAKE_CREW_STATE_charlie
+  unset FM_PAUSE_RESURFACE_SECS
+}
+
+test_signal_mixed_batch_absorbed() {
+  local dir state fakebin out pid
+  make_mixed_batch signal-mixed-batch-absorbed; dir="$MIXED_BATCH_DIR"; state="$dir/state"
+  fakebin="$dir/fakebin"; out="$dir/watch.out"
+  export FM_PAUSE_RESURFACE_SECS=999
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "a batch mixing one working crew with one paused crew surfaced instead of being absorbed: $(cat "$out")"
+  fi
+  wait_file_nonempty "$state/.seen-alpha_status" \
+    || { reap "$pid"; fail "the mixed batch did not advance the working task's .seen-* suppressor"; }
+  wait_file_nonempty "$state/.seen-bravo_status" \
+    || { reap "$pid"; fail "the mixed batch did not advance the paused task's .seen-* suppressor"; }
+  [ ! -s "$out" ] || { reap "$pid"; fail "the mixed batch printed a wake reason: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "the mixed batch enqueued a durable wake record"; }
+  # Only the PAUSED task joins the bounded pause cadence; the working task is
+  # covered by the stale path's wedge timer instead and must not be anchored here.
+  [ -s "$state/.paused-signal-since-bravo" ] || { reap "$pid"; fail "the paused task in a mixed batch lost its pause-episode anchor"; }
+  [ ! -e "$state/.paused-signal-since-alpha" ] || { reap "$pid"; fail "the working task in a mixed batch was anchored on the pause cadence"; }
+  reap "$pid"
+  unset_mixed_batch
+  pass "a coalesced batch mixing a working crew with a paused crew is absorbed, each task on its own absorb class"
+}
+
+# Guarantee (1) in its batch form, and the one that matters most: a crew that
+# FINISHES is never absorbed, even when every OTHER task in its batch is
+# absorbable. Per-task classification must never let an absorbable majority
+# swallow one finish. The whole-batch actionable test runs before any per-task
+# absorb for exactly this reason.
+test_signal_mixed_batch_terminal_always_surfaces() {
+  local dir state fakebin out drain_out pid
+  make_mixed_batch signal-mixed-batch-terminal; dir="$MIXED_BATCH_DIR"; state="$dir/state"
+  fakebin="$dir/fakebin"; out="$dir/watch.out"; drain_out="$dir/drain.out"
+  printf 'working: ran the suite\ndone: PR https://example.invalid/pull/7 checks green\n' > "$state/charlie.status"
+  export FM_PAUSE_RESURFACE_SECS=999
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 \
+    || { reap "$pid"; fail "a finished crew was absorbed inside an otherwise absorbable batch: $(cat "$out")"; }
+  grep -F "$state/charlie.status" "$out" >/dev/null \
+    || fail "the surfaced batch did not name the finished crew's status file: $(cat "$out")"
+  grep -F "declared pause" "$out" >/dev/null \
+    && fail "a batch containing a finish was mislabeled a declared-pause recheck: $(cat "$out")"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the mixed terminal batch failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "charlie.status" >/dev/null \
+    || fail "the finished crew's signal was not queued from the mixed batch"
+  unset_mixed_batch
+  pass "a terminal verb surfaces the WHOLE batch, however absorbable its companions are (a finish is never swallowed)"
+}
+
+# One task that found NO absorb class still surfaces the whole batch: a crew that
+# stopped its turn with no running pipeline, no busy pane and no declared wait may
+# be done through an interactive menu that wrote no done: status.
+test_signal_mixed_batch_stopped_crew_surfaces() {
+  local dir state fakebin out drain_out pid
+  make_mixed_batch signal-mixed-batch-stopped; dir="$MIXED_BATCH_DIR"; state="$dir/state"
+  fakebin="$dir/fakebin"; out="$dir/watch.out"; drain_out="$dir/drain.out"
+  : > "$state/charlie.turn-ended"
+  export FM_FAKE_CREW_STATE_charlie='state: unknown · source: none · no current-state source available'
+  export FM_PAUSE_RESURFACE_SECS=999
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 \
+    || { reap "$pid"; fail "a stopped crew was absorbed inside an otherwise absorbable batch: $(cat "$out")"; }
+  grep -F "$state/charlie.turn-ended" "$out" >/dev/null \
+    || fail "the surfaced batch did not name the stopped crew's turn-end: $(cat "$out")"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the mixed stopped batch failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "charlie.turn-ended" >/dev/null \
+    || fail "the stopped crew's signal was not queued from the mixed batch"
+  unset_mixed_batch
+  pass "one task with no absorb class surfaces the whole batch, however absorbable its companions are"
+}
+
+# Guarantee (2) in its batch form: away mode owns triage, so the watcher must
+# queue and exit on every wake - per-task absorb never runs there at all.
+test_signal_mixed_batch_afk_still_queues() {
+  local dir state fakebin out drain_out pid
+  make_mixed_batch signal-mixed-batch-afk; dir="$MIXED_BATCH_DIR"; state="$dir/state"
+  fakebin="$dir/fakebin"; out="$dir/watch.out"; drain_out="$dir/drain.out"
+  : > "$state/.afk"
+  export FM_PAUSE_RESURFACE_SECS=999
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "away mode did not queue an absorbable mixed batch"; }
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the away-mode mixed batch failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "alpha.status" >/dev/null \
+    || fail "away mode did not queue the working task of a mixed batch"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "bravo.status" >/dev/null \
+    || fail "away mode did not queue the paused task of a mixed batch"
+  unset_mixed_batch
+  pass "away mode still queues every wake in a mixed batch instead of absorbing it"
+}
+
+# Guarantee (3) in its batch form: a pause absorbed as part of a MIXED batch keeps
+# its bounded recheck, so it cannot rot invisibly behind a working companion. The
+# recheck is driven by the paused task's own episode anchor, and only that task's
+# throttle is stamped - a working companion never joins this cadence.
+test_signal_mixed_batch_paused_task_still_rechecked() {
+  local dir state fakebin out drain_out pid back
+  make_mixed_batch signal-mixed-batch-recheck; dir="$MIXED_BATCH_DIR"; state="$dir/state"
+  fakebin="$dir/fakebin"; out="$dir/watch.out"; drain_out="$dir/drain.out"
+  back=$(( $(date +%s) - 500 ))
+  printf '%s' "$back" > "$state/.paused-signal-since-bravo"
+  set_mtime "$back" "$state/.paused-signal-since-bravo"
+  export FM_PAUSE_RESURFACE_SECS=240
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 \
+    || { reap "$pid"; fail "an overdue pause inside a mixed batch never got its bounded recheck: $(cat "$out")"; }
+  grep -F "declared pause" "$out" >/dev/null \
+    || fail "the mixed-batch recheck was not labeled a declared-pause recheck: $(cat "$out")"
+  grep -F "possible wedge" "$out" >/dev/null \
+    && fail "a mixed-batch declared pause was mislabeled a possible wedge: $(cat "$out")"
+  [ -e "$state/.paused-signal-resurfaced-bravo" ] \
+    || fail "the paused task's re-surface throttle was not committed after the durable append"
+  [ ! -e "$state/.paused-signal-resurfaced-alpha" ] \
+    || fail "the working companion was stamped with a pause re-surface throttle"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the mixed-batch recheck failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "bravo.status" >/dev/null \
+    || fail "the mixed-batch declared-pause recheck was not queued"
+  unset_mixed_batch
+  pass "a pause absorbed inside a mixed batch keeps its own bounded recheck, and only that task is throttled"
+}
+
+# Guarantee (4) in its batch form: a crew that appends working: after a pause
+# leaves the declared-pause class at once. With no authoritative evidence it is
+# working, it has no absorb class left, so it surfaces the batch it arrived in.
+test_signal_mixed_batch_working_after_pause_surfaces() {
+  local dir state fakebin out drain_out pid
+  make_mixed_batch signal-mixed-batch-post-pause-working; dir="$MIXED_BATCH_DIR"; state="$dir/state"
+  fakebin="$dir/fakebin"; out="$dir/watch.out"; drain_out="$dir/drain.out"
+  printf 'paused: holding for the upstream release\nworking: release landed, resuming\n' > "$state/bravo.status"
+  export FM_PAUSE_RESURFACE_SECS=999
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 100 \
+    || { reap "$pid"; fail "a post-pause working: note stayed absorbed inside a mixed batch: $(cat "$out")"; }
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the post-pause mixed batch failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "bravo.status" >/dev/null \
+    || fail "the post-pause working: task was not queued from the mixed batch"
+  [ ! -e "$state/.paused-signal-since-bravo" ] \
+    || fail "a task that left its pause kept its pause-episode anchor"
+  unset_mixed_batch
+  pass "a working: note after a pause leaves the declared-pause class immediately, even inside a mixed batch"
 }
 
 # Guarantee (3), append-ordering half: the .paused-signal-resurfaced-<task>
@@ -1319,6 +1496,135 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   [ "$wakes" -eq 1 ] || fail "live external-decision gate should surface once, got $wakes wakes"
   [ "$bare" -eq 1 ] || fail "live external-decision gate lost its immediate bare stale surface"
   pass "exited declared-pause and captain-held panes use bounded pause cadence while a live decision gate still surfaces once"
+}
+
+# --- defect 1: a LIVE crew's declared pause is looked at once per EPISODE, not
+#     once per distinct pane hash ---------------------------------------------
+# The disconfirming look above ("a live external-decision gate must surface once")
+# was only ever once per stale HASH, and a parked pane's hash changes whenever its
+# content does - a spinner frame, an arriving steer, a timer line. So the look
+# re-opened on every repaint: pause_state_class returned `none` for a correctly
+# declared pause on a live ordinary crew, one stale branch mapped `none` to a
+# surface and the other to an absorb, and the tracked-episode fast path dropped
+# its own markers again on each pass. Firstmate watched this all through
+# 2026-08-24 with four crews parked on one quota reset, every one carrying a
+# correct `paused:` last line, each repaint costing a full supervision turn.
+# The fix makes the pause EPISODE the unit of that one look (pause_state_class's
+# `unconfirmed` class), so pane churn can no longer re-open it - while the bounded
+# PAUSE_RESURFACE_SECS recheck still guarantees the pause cannot rot invisibly.
+test_live_declared_pause_looks_once_per_episode_not_per_hash() {
+  local dir state fakebin out capture_file statusf window key pane_hash sig pid n wakes back
+  dir=$(make_case live-pause-episode); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/parked.status"
+  window="test:fm-parked"
+  printf 'waiting on the quota reset\n' > "$capture_file"
+  # harness=grok + a grok foreground command is a LIVE agent, so this is the exact
+  # case that used to re-surface: a live ordinary crew under a correct pause.
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/parked.meta"
+  printf 'paused: waiting on the vendor quota reset\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-parked_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "waiting on the quota reset")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  # Round 1: the one disconfirming look for this pause episode.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting on the vendor quota reset' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; fail "a live crew's first declared pause did not get its one look"; }
+  [ -e "$state/.paused-$key" ] || fail "the one look did not establish the pause episode"
+
+  # Rounds 2-5: the pane repaints every round, so every round is a DISTINCT stale
+  # hash - the exact churn that used to re-open the look. Each must be absorbed.
+  n=2
+  while [ "$n" -le 5 ]; do
+    printf 'waiting on the quota reset (token %s)\n' "$n" > "$capture_file"
+    pane_hash=$(hash_text "waiting on the quota reset (token $n)")
+    printf '%s' "$pane_hash" > "$state/.hash-$key"
+    printf '1\n' > "$state/.count-$key"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+      FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting on the vendor quota reset' \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+    pid=$!
+    if ! wait_live "$pid" 40; then
+      wait "$pid" 2>/dev/null || true
+      fail "a repainted pane under a still-standing declared pause re-opened the one look on round $n: $(cat "$out")"
+    fi
+    [ -e "$state/.stale-since-$key" ] && { reap "$pid"; fail "an absorbed declared pause started the wedge timer on round $n"; }
+    reap "$pid"
+    n=$((n + 1))
+  done
+  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")
+  [ "$wakes" -eq 1 ] || fail "a live declared pause cost $wakes wakes across four pane repaints; the episode must get exactly one look"
+
+  # Guarantee (3) on this newly-absorbing path: the pause still cannot rot
+  # invisibly. Age both the pause itself and the throttle the one look stamped
+  # (that throttle is what keeps the cadence to once per window rather than once
+  # per poll), and it re-surfaces once, as a recheck - never as a wedge.
+  back=$(( $(date +%s) - 500 ))
+  set_mtime "$back" "$statusf"
+  [ -e "$state/.paused-resurfaced-$key" ] || fail "the one look did not record a re-surface throttle"
+  set_mtime "$back" "$state/.paused-resurfaced-$key"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-parked_status"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting on the vendor quota reset' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { reap "$pid"; fail "an absorbed live declared pause never came due for its bounded recheck"; }
+  grep -F "awaiting external" "$out" >/dev/null \
+    || fail "the bounded recheck of a live declared pause was not labeled a paused recheck: $(cat "$out")"
+  grep -F "possible wedge" "$out" >/dev/null \
+    && fail "the bounded recheck of a live declared pause was mislabeled a possible wedge: $(cat "$out")"
+  pass "a live crew's declared pause gets ONE look per episode, absorbs every pane repaint after it, and still comes due for its bounded recheck"
+}
+
+# Guarantee (1) on the stale path, restated against the newly-absorbing case: a
+# crew that finishes under a live agent must surface at once even though its
+# pause episode was already established and absorbing.
+test_terminal_after_established_pause_episode_still_surfaces() {
+  local dir state fakebin out drain_out capture_file statusf window key pane_hash sig pid
+  dir=$(make_case terminal-after-pause-episode); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  statusf="$state/parked.status"; window="test:fm-parked"
+  printf 'the run finished\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/parked.meta"
+  printf 'paused: waiting on the vendor quota reset\ndone: quota returned, PR https://example.invalid/pull/9 checks green\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-parked_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "the run finished")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # An established, currently-absorbing pause episode for this exact key.
+  : > "$state/.paused-$key"
+  date +%s > "$state/.paused-rechecked-$key"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: done · source: run-step · run passed' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 \
+    || { reap "$pid"; fail "a finish behind an established pause episode was swallowed by the pause cadence: $(cat "$out")"; }
+  grep -F "$window" "$out" >/dev/null || fail "the surfaced finish did not name the window: $(cat "$out")"
+  grep -F "awaiting external" "$out" >/dev/null \
+    && fail "a finish was surfaced as a paused recheck instead of a real wake: $(cat "$out")"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the post-pause finish failed"
+  grep -F "$window" "$drain_out" >/dev/null || fail "the post-pause finish was not queued"
+  pass "a finish surfaces at once even when the window's pause episode was established and absorbing"
 }
 
 test_secondmate_paused_resurfaces_in_normal_mode() {
@@ -2445,8 +2751,7 @@ test_classifier_primitives
 test_crew_is_provably_working_classifier
 test_status_is_paused_classifier
 test_crew_absorb_class_classifier
-test_signal_crew_provably_working_classifier
-test_signal_crew_declared_paused_classifier
+test_signal_absorb_classes_classifier
 test_provably_working_signal_absorbed
 test_turn_ended_provably_working_absorbed
 test_signal_declared_paused_absorbed
@@ -2456,6 +2761,12 @@ test_signal_pause_markers_cleared_when_pause_resolves
 test_signal_terminal_after_pause_always_surfaces
 test_signal_declared_paused_afk_still_queues
 test_signal_working_after_pause_returns_to_normal
+test_signal_mixed_batch_absorbed
+test_signal_mixed_batch_terminal_always_surfaces
+test_signal_mixed_batch_stopped_crew_surfaces
+test_signal_mixed_batch_afk_still_queues
+test_signal_mixed_batch_paused_task_still_rechecked
+test_signal_mixed_batch_working_after_pause_surfaces
 test_signal_declared_paused_failed_append_keeps_the_recheck_due
 test_signal_pause_anchor_planted_while_afk_owns_triage
 test_turn_ended_not_working_surfaced
@@ -2478,6 +2789,8 @@ test_busy_pane_default_turn_age_bound_is_3600s
 test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces
+test_live_declared_pause_looks_once_per_episode_not_per_hash
+test_terminal_after_established_pause_episode_still_surfaces
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_nonpaused_stale_remains_suppressed
 test_secondmate_unpause_clears_pause_tracking
