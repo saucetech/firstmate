@@ -23,7 +23,9 @@ No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign 
 A crew that declares `paused:` for a known external wait is separately absorbed while idle - on the signal path as well as the stale path - and re-surfaced only on the longer `FM_PAUSE_RESURFACE_SECS` cadence, rather than being treated as a possible wedge; `bin/fm-watch.sh`'s header owns the exact triage contract for both paths.
 For an ordinary crew that has stopped, the normal-mode watcher first surfaces one stale wake, then applies that same cadence to an unchanged `paused:` or durable `captain-held` endpoint only when the backend confidently reports its agent dead.
 Live or inconclusive liveness remains fail-open at that initial surface, and the secondmate idle-endpoint exemption is unchanged.
-Its normal-mode status signals no longer surface through the no-verb path at all: each one is absorbed under the declared-pause class and the bounded `FM_PAUSE_RESURFACE_SECS` recheck, measured from when the pause was first observed, is the only look it is guaranteed, while away mode still queues every wake and its daemon owns triage.
+Its normal-mode status signals are absorbed under the declared-pause class whenever EVERY task referenced by that wake is paused, and the bounded `FM_PAUSE_RESURFACE_SECS` recheck, measured from when the pause was first observed, is the only look such a wake is guaranteed.
+The absorb classes are all-or-nothing over a coalesced batch, so a paused crew's append that lands inside the same `FM_SIGNAL_GRACE` window as another crew's turn-end still surfaces.
+Away mode is unchanged: it queues every wake and its daemon owns triage.
 Fresh stale panes use the same current-state read before trusting the status log, so an active run or a proven busy worker outranks an old captain-relevant status-log line left behind before validation.
 No-change heartbeats are also benign.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.

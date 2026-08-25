@@ -148,10 +148,7 @@ write_epoch() {  # <outcome>
 write_epoch arming
 
 # X mode cadence: source the generated config so an X instance polls at its
-# 30s cadence (fm-bootstrap.sh x_mode_setup contract). General cadence tuning
-# (config/watch.env) is NOT sourced here: it lives in bin/fm-watch-arm.sh, the
-# shared arm wrapper this hook foregrounds below, so every supervision protocol
-# gets the knob rather than only a Claude primary.
+# 30s cadence (fm-bootstrap.sh x_mode_setup contract).
 # shellcheck source=/dev/null
 [ -f "$CONFIG/x-mode.env" ] && . "$CONFIG/x-mode.env"
 

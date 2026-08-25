@@ -306,21 +306,6 @@ The locked bootstrap inheritance pass uses the same per-home changed-set and rer
 That live discovery starts from `state/*.meta` records with `kind=secondmate`; `data/secondmates.md` only backfills `home=` for older or incomplete meta records.
 Skipped items, such as a destination checkout that does not yet gitignore the item, are visible warnings but not hard failures.
 
-## Watcher cadence tuning (config/watch.env)
-
-`config/watch.env` is an optional, local, gitignored shell file (covered by the blanket `config/` `.gitignore` entry, alongside every other local config item in this doc) that a home may use to tune `bin/fm-watch.sh` cadence knobs without editing tracked code.
-`bin/fm-watch-arm.sh` sources it, when present, before sourcing `config/x-mode.env`, so an X-mode home's generated cadence still wins over any general tuning in `watch.env`.
-The sourcing lives in that shared arm wrapper rather than in any one harness's hook, so the knob reaches the watcher from every supervision protocol that funnels through it: the Claude Stop hook (`bin/fm-claude-stop-autoarm.sh`), the OpenCode plugin, the Pi extension, and the Grok tracked background task.
-Codex's foreground checkpoint path is the one documented exception and does NOT get the knob: [`supervision-protocols/codex`](supervision-protocols/codex.md) directs Codex not to run `bin/fm-watch-arm.sh` and to use `bin/fm-watch-checkpoint.sh` instead, which execs `bin/fm-watch.sh` directly and so bypasses the arm wrapper entirely.
-That protocol sources `config/x-mode.env` explicitly in its own command position, which is also the only config `bin/fm-arm-command-policy.mjs` blesses there, so a Codex-primary home tunes cadence through the environment its checkpoint command runs in rather than through `config/watch.env`.
-A missing file is silently skipped; a malformed or unreadable file fails only the bad line inside it, never arming itself, since `bin/fm-watch-arm.sh` runs under `set -u` without `set -e`.
-Assignments need no `export`: the arm wrapper sources both files under `set -a`, so a plain `FM_SIGNAL_GRACE=120` line is exported and reaches the watcher child process it forks.
-`FM_SIGNAL_GRACE` (default `30`, seconds) is the primary knob: it is the grace period `bin/fm-watch.sh`'s signal path lingers after a status or turn-end file changes before classifying the wake, so a crewmate's final status write and the same turn's turn-end hook land inside one coalesced wake instead of two.
-Because every actionable wake costs firstmate a full supervision turn, raising `FM_SIGNAL_GRACE` directly reduces how many turns a busy fleet's trailing signal bursts cost, at the price of added latency before an actionable wake is queued.
-Like `config/x-mode.env`, `bin/fm-watch.sh` reads this cadence only at process start, so a change is applied by restarting the home-scoped watcher.
-`config/watch.env` is NOT inherited by secondmate homes: it is absent from `FM_INHERITABLE_CONFIG` in `bin/fm-config-inherit-lib.sh`, so a secondmate keeps the default cadence unless its own home has its own `config/watch.env`.
-That is deliberate - cadence tuning answers how noisy one home's fleet is, which is a per-home property, not a primary-authoritative one.
-
 ## X mode (.env)
 
 X mode lets a firstmate instance answer public `@myfirstmate` mentions and act on normal reversible mention requests through firstmate's normal lifecycle.
