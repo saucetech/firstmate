@@ -146,6 +146,91 @@ test_attached_arm_still_fails_on_a_wake_it_did_not_deliver() {
   pass "watch-arm: a cycle that delivered no wake of its own still fails loudly"
 }
 
+# --- config/watch.env: the general watcher cadence knob ----------------------
+# docs/configuration.md "Watcher cadence tuning" gives a home an optional,
+# gitignored config/watch.env for FM_SIGNAL_GRACE and similar knobs. The sourcing
+# lives in THIS wrapper, not in any one harness's hook, because the Claude Stop
+# hook, the OpenCode plugin, the Pi extension and the Grok tracked background
+# task all funnel through it; a hook-local sourcing left the knob silently inert
+# for every non-Claude primary. Codex's foreground bin/fm-watch-checkpoint.sh
+# path is the documented exception and is not exercised here.
+#
+# These cases run the REAL bin/fm-watch-arm.sh through a bin/ of symlinks whose
+# fm-watch.sh is a stub that records the environment it was actually forked
+# with, so each one proves what the wrapper hands the watcher child rather than
+# what its own shell happens to hold.
+make_arm_env_case() {  # <name>
+  local name=$1 dir bin
+  dir="$TMP_ROOT/$name"
+  bin="$dir/bin"
+  mkdir -p "$dir/state" "$dir/config" "$bin"
+  ln -s "$ROOT/bin/fm-watch-arm.sh" "$bin/fm-watch-arm.sh"
+  ln -s "$ROOT/bin/fm-wake-lib.sh" "$bin/fm-wake-lib.sh"
+  cat > "$bin/fm-watch.sh" <<'SH'
+#!/usr/bin/env bash
+{
+  printf 'FM_SIGNAL_GRACE=%s\n' "${FM_SIGNAL_GRACE:-<unset>}"
+  printf 'FM_CHECK_INTERVAL=%s\n' "${FM_CHECK_INTERVAL:-<unset>}"
+} > "$FM_STATE_OVERRIDE/watch-env"
+printf 'signal: %s/fixture.status\n' "$FM_STATE_OVERRIDE"
+exit 0
+SH
+  chmod +x "$bin/fm-watch.sh"
+  printf '%s\n' "$dir"
+}
+
+# Run the wrapper as a non-Claude primary would: spawn it directly, with no hook
+# in the process tree that could have sourced anything on its behalf.
+run_arm_env_case() {  # <dir>
+  local dir=$1
+  FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state" FM_ARM_CONFIRM_TIMEOUT=3 \
+    FM_ARM_ATTACH_POLL=0.1 "$dir/bin/fm-watch-arm.sh" 2>&1
+}
+
+test_watch_env_reaches_the_watcher_from_the_shared_arm_wrapper() {
+  local dir out status dump
+  dir=$(make_arm_env_case watch-env-reaches-watcher)
+  # No `export`: the wrapper sources under `set -a`, so a plain assignment must
+  # still reach the forked watcher child.
+  printf 'FM_SIGNAL_GRACE=77\n' > "$dir/config/watch.env"
+  out=$(run_arm_env_case "$dir"); status=$?
+  expect_code 0 "$status" "arming with a config/watch.env present must still close cleanly"
+  [ -e "$dir/state/watch-env" ] || fail "the arm wrapper never forked the watcher: $out"
+  dump=$(cat "$dir/state/watch-env")
+  grep -Fx "FM_SIGNAL_GRACE=77" "$dir/state/watch-env" >/dev/null \
+    || fail "config/watch.env's cadence knob did not reach the watcher a non-Claude primary armed: $dump"
+  pass "watch-arm: config/watch.env reaches the watcher from the shared arm wrapper, with no export needed"
+}
+
+test_x_mode_env_still_wins_over_watch_env() {
+  local dir out status dump
+  dir=$(make_arm_env_case watch-env-x-mode-precedence)
+  printf 'FM_SIGNAL_GRACE=77\nFM_CHECK_INTERVAL=999\n' > "$dir/config/watch.env"
+  printf 'export FM_CHECK_INTERVAL=30\n' > "$dir/config/x-mode.env"
+  out=$(run_arm_env_case "$dir"); status=$?
+  expect_code 0 "$status" "arming with both cadence configs present must still close cleanly"
+  [ -e "$dir/state/watch-env" ] || fail "the arm wrapper never forked the watcher: $out"
+  dump=$(cat "$dir/state/watch-env")
+  grep -Fx "FM_CHECK_INTERVAL=30" "$dir/state/watch-env" >/dev/null \
+    || fail "config/x-mode.env's generated cadence did not win over config/watch.env: $dump"
+  grep -Fx "FM_SIGNAL_GRACE=77" "$dir/state/watch-env" >/dev/null \
+    || fail "config/x-mode.env's precedence dropped watch.env's non-conflicting knob: $dump"
+  pass "watch-arm: config/x-mode.env's generated cadence still wins over config/watch.env"
+}
+
+test_malformed_watch_env_does_not_break_arming() {
+  local dir out status
+  dir=$(make_arm_env_case watch-env-malformed)
+  printf 'this is not valid shell ((( \n' > "$dir/config/watch.env"
+  out=$(run_arm_env_case "$dir"); status=$?
+  expect_code 0 "$status" "a malformed config/watch.env must not break arming"
+  [ -e "$dir/state/watch-env" ] || fail "a malformed config/watch.env stopped the wrapper forking the watcher: $out"
+  pass "watch-arm: a malformed config/watch.env fails past its own bad line without breaking arming"
+}
+
 test_attached_arm_reports_the_delivered_wake
 test_attached_arm_reports_the_delivered_wake_after_drain
 test_attached_arm_still_fails_on_a_wake_it_did_not_deliver
+test_watch_env_reaches_the_watcher_from_the_shared_arm_wrapper
+test_x_mode_env_still_wins_over_watch_env
+test_malformed_watch_env_does_not_break_arming

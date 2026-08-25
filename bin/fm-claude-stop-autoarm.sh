@@ -147,17 +147,11 @@ write_epoch() {  # <outcome>
 
 write_epoch arming
 
-# Optional general watcher cadence tuning (docs/configuration.md "config/watch.env"):
-# a home may set FM_SIGNAL_GRACE and similar knobs without editing tracked code.
-# Sourced BEFORE x-mode.env so X mode's generated cadence still wins when both are
-# present. Same guard as x-mode.env below: a missing or unreadable file is simply
-# skipped, and set -u without set -e means a malformed file's bad line fails that
-# one command without aborting arming.
-# shellcheck source=/dev/null
-[ -f "$CONFIG/watch.env" ] && . "$CONFIG/watch.env"
-
 # X mode cadence: source the generated config so an X instance polls at its
-# 30s cadence (fm-bootstrap.sh x_mode_setup contract).
+# 30s cadence (fm-bootstrap.sh x_mode_setup contract). General cadence tuning
+# (config/watch.env) is NOT sourced here: it lives in bin/fm-watch-arm.sh, the
+# shared arm wrapper this hook foregrounds below, so every supervision protocol
+# gets the knob rather than only a Claude primary.
 # shellcheck source=/dev/null
 [ -f "$CONFIG/x-mode.env" ] && . "$CONFIG/x-mode.env"
 

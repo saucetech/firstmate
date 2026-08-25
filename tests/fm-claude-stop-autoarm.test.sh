@@ -144,22 +144,6 @@ printf 'stale: fixture-win actionable\n'
 exit 0
 SH
       ;;
-    env-dump)
-      # Records the exported env the hook handed the arm process (config/watch.env
-      # and config/x-mode.env sourcing effects), then closes actionable so the
-      # cycle both records state and completes.
-      cat > "$dir/bin/fm-watch-arm.sh" <<'SH'
-#!/usr/bin/env bash
-echo "$$" >> "$FM_HOME/state/arm-ran"
-{
-  printf 'FM_SIGNAL_GRACE=%s\n' "${FM_SIGNAL_GRACE:-<unset>}"
-  printf 'FM_CHECK_INTERVAL=%s\n' "${FM_CHECK_INTERVAL:-<unset>}"
-} > "$FM_HOME/state/arm-env"
-printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
-printf 'stale: fixture-win actionable\n'
-exit 0
-SH
-      ;;
     *)
       echo "unknown arm fixture: $kind" >&2
       return 2
@@ -359,45 +343,6 @@ test_actionable_close_rewakes_with_reason() {
   [ ! -e "$dir/state/.claude-autoarm.lock" ] || fail "owner lock must be released after the cycle"
   [ -e "$dir/state/arm-ran" ] || fail "hook never foregrounded the arm wrapper"
   pass "auto-arm: actionable close translates to exactly one exit-2 rewake with reason"
-}
-
-# config/watch.env (docs/configuration.md "Watcher cadence tuning") lets a home
-# tune general watcher cadence without editing tracked code. It must be sourced
-# BEFORE config/x-mode.env so an X-mode home's generated cadence still wins when
-# both set the same variable.
-test_watch_env_sourced_before_x_mode_env() {
-  local dir out status
-  dir=$(make_primary_dir "$TMP_ROOT/watch-env-precedence")
-  : > "$dir/state/task.meta"
-  mkdir -p "$dir/config"
-  printf 'export FM_SIGNAL_GRACE=77\nexport FM_CHECK_INTERVAL=999\n' > "$dir/config/watch.env"
-  printf 'export FM_CHECK_INTERVAL=30\n' > "$dir/config/x-mode.env"
-  write_arm_fixture "$dir" env-dump
-  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
-  expect_code 2 "$status" "an actionable arm close must still exit 2 with watch.env present"
-  [ -e "$dir/state/arm-env" ] || fail "hook never foregrounded the arm wrapper with watch.env present"
-  grep -Fx "FM_SIGNAL_GRACE=77" "$dir/state/arm-env" >/dev/null \
-    || fail "config/watch.env's own cadence knob did not reach the arm process: $(cat "$dir/state/arm-env")"
-  grep -Fx "FM_CHECK_INTERVAL=30" "$dir/state/arm-env" >/dev/null \
-    || fail "config/x-mode.env's cadence did not win over config/watch.env's conflicting value: $(cat "$dir/state/arm-env")"
-  pass "config/watch.env is sourced before config/x-mode.env, so X mode's generated cadence still wins"
-}
-
-# A malformed or unreadable config/watch.env must never break arming - the hook
-# runs under set -u without set -e, so a bad line inside the sourced file fails
-# only that one command, and arming proceeds exactly as if the file were absent.
-test_malformed_watch_env_does_not_break_arming() {
-  local dir out status
-  dir=$(make_primary_dir "$TMP_ROOT/watch-env-malformed")
-  : > "$dir/state/task.meta"
-  mkdir -p "$dir/config"
-  printf 'this is not valid shell ((( \n' > "$dir/config/watch.env"
-  write_arm_fixture "$dir" actionable
-  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
-  expect_code 2 "$status" "a malformed config/watch.env must not prevent the actionable rewake"
-  assert_contains "$out" "stale: fixture-win actionable" "arming must still proceed past a malformed config/watch.env"
-  [ -e "$dir/state/arm-ran" ] || fail "hook never foregrounded the arm wrapper past a malformed config/watch.env"
-  pass "a malformed config/watch.env fails past its own bad line without breaking arming"
 }
 
 test_actionable_close_with_live_successor_rewakes_once() {
@@ -639,8 +584,6 @@ test_stale_lock_recovery_preserves_afk_and_need_gates
 test_resolves_outermost_claude_pid_in_nested_bgspare_chain
 test_inert_when_fleet_idle
 test_actionable_close_rewakes_with_reason
-test_watch_env_sourced_before_x_mode_env
-test_malformed_watch_env_does_not_break_arming
 test_actionable_close_with_live_successor_rewakes_once
 test_failed_close_rewakes_with_failure_banner
 test_failed_cycles_notify_once_and_keep_retrying

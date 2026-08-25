@@ -64,6 +64,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
+CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+
+# Watcher cadence config lives HERE, in the one blessed arm wrapper every
+# supervision protocol funnels through (the Claude Stop hook, the OpenCode
+# plugin, the Pi extension, and the Grok tracked background task), so a home's
+# knobs reach the watcher whatever its primary harness is - not in any single
+# harness's hook. Codex's foreground checkpoint path is the documented exception:
+# docs/supervision-protocols/codex.md directs it to bin/fm-watch-checkpoint.sh,
+# which execs bin/fm-watch.sh directly and so bypasses this wrapper entirely.
+# Ordering is the contract: config/watch.env is general local tuning and is
+# sourced FIRST, then config/x-mode.env, so an X-mode home's generated cadence
+# still wins when both set the same variable. Both are guarded the same way: a
+# missing or unreadable file is simply skipped, and set -u without set -e means a
+# malformed file's bad line fails that one command without aborting arming.
+# `set -a` spans the sourcing so a plain `FM_SIGNAL_GRACE=120` assignment is
+# exported and reaches the watcher child; neither file needs `export`.
+set -a
+# shellcheck source=/dev/null
+[ -f "$CONFIG/watch.env" ] && . "$CONFIG/watch.env"
+# shellcheck source=/dev/null
+[ -f "$CONFIG/x-mode.env" ] && . "$CONFIG/x-mode.env"
+set +a
+
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 WATCH_LOCK="$STATE/.watch.lock"
 BEAT="$STATE/.last-watcher-beat"
