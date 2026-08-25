@@ -23,7 +23,7 @@ No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign 
 A crew that declares `paused:` for a known external wait is separately absorbed while idle - on the signal path as well as the stale path - and re-surfaced only on the longer `FM_PAUSE_RESURFACE_SECS` cadence, rather than being treated as a possible wedge; `bin/fm-watch.sh`'s header owns the exact triage contract for both paths.
 For an ordinary crew that has stopped, the normal-mode watcher first surfaces one stale wake, then applies that same cadence to an unchanged `paused:` or durable `captain-held` endpoint only when the backend confidently reports its agent dead.
 Live or inconclusive liveness remains fail-open at that initial surface, and the secondmate idle-endpoint exemption is unchanged.
-Its normal-mode status signals are absorbed under the declared-pause class whenever EVERY task referenced by that wake is paused, and the bounded `FM_PAUSE_RESURFACE_SECS` recheck, measured from when the pause was first observed, is the only look such a wake is guaranteed.
+A crew that declared `paused:` has its normal-mode status signals absorbed under the declared-pause class whenever EVERY task referenced by that wake is paused, and the bounded `FM_PAUSE_RESURFACE_SECS` recheck, measured from when the pause was first observed, is the only look such a wake is guaranteed.
 The absorb classes are all-or-nothing over a coalesced batch, so a paused crew's append that lands inside the same `FM_SIGNAL_GRACE` window as another crew's turn-end still surfaces.
 Away mode is unchanged: it queues every wake and its daemon owns triage.
 Fresh stale panes use the same current-state read before trusting the status log, so an active run or a proven busy worker outranks an old captain-relevant status-log line left behind before validation.
@@ -31,7 +31,7 @@ No-change heartbeats are also benign.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.
 After each drain, `fm-wake-drain.sh` runs the same liveness guard as the supervision scripts, so a lapsed watcher chain surfaces even on a turn that only drains and handles queued wakes.
 Routine watcher polling, supervision no-ops, elapsed waiting time, and absorbed benign wakes stay silent.
-A declared external wait trades that silence for one bounded recheck per pause window, so a forgotten pause cannot remain invisible indefinitely.
+A declared external wait trades that silence for a bounded recheck once per `FM_PAUSE_RESURFACE_SECS` on each path that absorbed it, so a forgotten pause cannot remain invisible indefinitely.
 Crew status files are append-only wake-event logs, not current-state fields.
 `bin/fm-crew-state.sh <id>` is the cheap current-state read for an actionable heartbeat review: it attributes a no-mistakes run, active or terminal, only when it matches the crew's branch and current code identity, then keeps that run-step authoritative even if the pane has closed.
 The script header owns the exact run-head ancestry rules.
